@@ -1,0 +1,3607 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+rm(list = ls())
+gc()
+library(parallel)
+library(Seurat)
+library(URD)
+library(Matrix)
+library(clustree)
+library(ggplot2)
+library(xlsx)
+library(ggpubr)
+library(msigdbr)
+library(fgsea)
+library(scatterpie)
+library(FSA)
+library(rcompanion)
+wd = getwd()
+
+dropNA = function(x){
+  x = x[!is.na(x)]
+  return(x)
+}
+
+flip <- function(x){
+  x = as.matrix(x)
+  y = t(apply(x, 2, rev))
+  rownames(y)=colnames(x)
+  colnames(y)=rev(rownames(x))
+  return (y)
+}
+
+gexp = function(scRNA = scRNA, gene, reduction = "UMAP"){
+  if(reduction %in% c("TSNE", "UMAP", "PCA")){
+    reduction = tolower(reduction)
+  }
+  
+  df = data.frame(scale = scRNA@assays$integrated@scale.data[gene,rownames(scRNA[[]])],
+                  counts = scRNA@assays$RNA@counts[gene,rownames(scRNA[[]])],
+                  x = scRNA@reductions[[reduction]]@cell.embeddings[rownames(scRNA[[]]),1],
+                  y = scRNA@reductions[[reduction]]@cell.embeddings[rownames(scRNA[[]]),2])
+  
+  df$value = df$scale
+  df$value = df$value + 0.01 - min(df$value[df$counts>0])
+  df$value[df$counts==0] = 0
+  p = ggplot(df, aes(x = x, y = y, color = value))+
+    geom_point() + labs(title = gene, x = paste(reduction, 1, sep = "_"), y = paste(reduction, 2, sep = "_")) +
+    scale_color_gradientn(name = "Scaled\nexpression\nlevel",
+                          values = c(0, quantile(df$value[df$value>0]))/max(df$value),
+                          colors = alpha(c("gray", rev(hcl.colors(5, "RdYlBu"))),0.5))+
+    theme_classic()
+  return(p)
+}
+```
+
+```{r}
+wd = getwd()
+setwd(paste0(wd, "/dt"))
+load("res_epi.Rdata")
+```
+
+```{r}
+setwd(paste0(wd, "/dt"))
+
+markers = read.xlsx(file = "Gene_markers.xlsx", sheetName = "Sheet1")
+markers$gene = toupper(markers$gene)
+
+#markers = markers[markers$ofi=="yes",]
+el = as.character(markers$group)
+el = sapply(el, function(x){
+  paste(toupper(substr(x,1,1)), substr(x,2,nchar(x)), sep = "")
+})
+
+el = sapply(el, function(x){
+  if(nchar(x)>25){
+    x = paste(substr(x, 1, which(strsplit(x, "")[[1]]==" ")[which.min(abs((2*which(strsplit(x, "")[[1]]==" ")/nchar(x))-1))]-1),substr(x, which(strsplit(x, "")[[1]]==" ")[which.min(abs((2*which(strsplit(x, "")[[1]]==" ")/nchar(x))-1))]+1, nchar(x)), sep = "\n")
+  }
+  return(x)
+})
+markers$group = as.factor(el)
+#markers
+```
+
+```{r}
+
+setwd(paste0(wd, "/dt"))
+dsigdb = gmtPathways("dsigdb_D1.gmt")
+
+dsigdb = lapply(dsigdb, function(x){x = intersect(x, res$hgnc)})
+dsigdb = dsigdb[sapply(dsigdb, length)>0]
+
+setwd(paste0(wd, "/dt"))
+aed = read.xlsx("AED.xlsx", sheetName = "Sheet1")
+
+names(dsigdb) = tolower(names(dsigdb))
+
+dsigdb = dsigdb[tolower(names(dsigdb)) %in% gsub("-", " ", tolower(aed$Pharmaceutical))]
+```
+
+
+
+
+```{r}
+setwd(paste0(wd, "/dt"))
+
+drh = read.xlsx("repurposing_drugs_20200324.xlsx", sheetName = "repurposing_drugs_20200324")
+drh = drh[!is.na(drh$target),]
+
+drh = setNames(strsplit(drh$target, "\\|"), drh$pert_iname)
+drh = lapply(drh, function(x){x = intersect(x, res$hgnc)})
+drh = drh[sapply(drh, length)>0]
+names(drh) = tolower(gsub("\\-", " ", names(drh)))
+
+drh = drh[tolower(gsub(" ", "-", names(drh))) %in% tolower(aed$Pharmaceutical)]
+```
+
+```{r}
+c3 = msigdbr(species = "Homo sapiens", category = "C3", subcategory = "TFT:TFT_Legacy")
+c3 = c3 %>% split(x = .$gene_symbol, f = .$gs_name)
+
+c2 = msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CGP")
+c2 = c2 %>% split(x = .$gene_symbol, f = .$gs_name)
+
+setwd(paste0(wd, "/dt"))
+enc = gmtPathways("gene_set_library_crisp.gmt")
+
+ig = unique(c("REST", res[!res$gr=="nc","hgnc"], enc$REST, unlist(c2[grepl("VERHAAK_GLIOBLASTOMA", names(c2))]), c3$NRSF_01, markers$gene, cc.genes.updated.2019$s.genes, cc.genes.updated.2019$g2m.genes, unlist(dsigdb), unlist(drh)))
+#ig
+```
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+
+
+m = list()
+m[["CE_EPILEPSY_UP"]] = res[res$gr == "Upregulated","hgnc"]
+m[["CE_EPILEPSY_DN"]] = res[res$gr == "Downregulated","hgnc"]
+m[["REST"]] = c3[["NRSF_01"]]
+for(el in unique(dropNA(markers$Big_group))){
+  m[[el]] = as.character(dropNA(markers[markers$Big_group == el,]$gene))
+}
+m = c(m, c2[grepl("LEIN_", names(c2))])
+m = m[!grepl("KLEIN", names(m))]
+m = c(m, c2[c("BHATTACHARYA_EMBRYONIC_STEM_CELL", "BOQUEST_STEM_CELL_DN", "BOQUEST_STEM_CELL_UP", "CONRAD_GERMLINE_STEM_CELL", "CONRAD_STEM_CELL",  "JINESH_BLEBBISHIELD_TRANSFORMED_STEM_CELL_SPHERES_DN", "JINESH_BLEBBISHIELD_TRANSFORMED_STEM_CELL_SPHERES_UP", "LEE_NEURAL_CREST_STEM_CELL_DN", "LEE_NEURAL_CREST_STEM_CELL_UP", "WONG_ADULT_TISSUE_STEM_MODULE", "WONG_EMBRYONIC_STEM_CELL_CORE", names(c2[grepl("glio", tolower(names(c2)))]))])
+m$codel1p19q = dropNA(c(res[grepl("q", tolower(res$band)) & res$chr == 19,"hgnc"], res[grepl("p", tolower(res$band)) & res$chr == 1,"hgnc"]))
+```
+
+
+```{r}
+### Prerequisites
+```
+
+
+```{r}
+setwd(paste0(wd, "/dt"))
+
+load(file = "GSE70630_SCT.Rdata")
+load(file = "GSE131928_smartseq2_SCT.Rdata")
+load(file = "GSE89567_SCT.Rdata")
+
+'load(file = "GSE138794_SCT.Rdata")
+GSE138794 = GSE138794[!names(GSE138794)=="GSM4119533"]
+GSE138794 = GSE138794[!names(GSE138794)=="GSM4119531"]'
+
+#load(file = "GSE84465.Rdata")
+
+scRNA.assays = c(GSE70630, GSE89567, GSE131928) #, GSE138794 GSE84465
+scRNA.assays
+```
+
+
+
+
+```{r}
+x = list()
+
+for(X in names(scRNA.assays)){
+  el = scRNA.assays[[X]]
+  x[[X]] = rowSums(el@assays$RNA@counts>0) / dim(el@assays$RNA@counts)[2]
+}
+
+
+x = sapply(x, function(el){
+  el[unique(unlist(sapply(x, names)))]
+})
+
+
+x[is.na(x)] = 0
+
+
+ig = intersect(ig, names(rowMeans(x)[rowMeans(x)>0.1]))
+ig
+
+setwd(paste0(wd, "/scRNA_res"))
+save(ig, file = "ig.Rdata")
+
+#save(scRNA.assays, ig, file = "script_data.Rdata")
+
+#setwd(paste0(wd, "/scRNA_res"))
+#load("ig.Rdata")
+```
+
+
+
+
+
+```{r}
+lapply(scRNA.assays, function(el){
+  table(el$prim_ident)
+})
+```
+
+
+
+```{r}
+memory.limit(10*16257)
+options(future.globals.maxSize = 8*500*1024^2)
+
+
+rm(list = c("GSE70630", "GSE89567", "GSE131928"))
+
+EL <- SelectIntegrationFeatures(object.list = scRNA.assays, nfeatures = 3000)
+
+scRNA <- PrepSCTIntegration(object.list = scRNA.assays, anchor.features = EL)
+rm(list = c("scRNA.assays"))
+
+scRNA <- FindIntegrationAnchors(object.list = scRNA, normalization.method = "SCT", anchor.features = EL, reference = which(names(scRNA) == "MGH54"), dims = 1:30, reduction = "rpca", k.anchor = 15)
+scRNA <- IntegrateData(anchorset = scRNA, normalization.method = "SCT", features.to.integrate = unique(c(scRNA@anchor.features, ig)))
+
+setwd(paste0(wd, "/scRNA_res"))
+save(scRNA, file = "integrated_3_SCT_RPCA.Rdata")
+```
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+
+#c2 = msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CGP")
+#c2 = c2 %>% split(x = .$gene_symbol, f = .$gs_name)
+
+m = list()
+m[["CE_EPILEPSY_UP"]] = res[res$gr == "Upregulated","hgnc"]
+m[["CE_EPILEPSY_DN"]] = res[res$gr == "Downregulated","hgnc"]
+m[["REST"]] = c3[["NRSF_01"]]
+for(el in unique(dropNA(markers$Big_group))){
+  m[[el]] = as.character(dropNA(markers[markers$Big_group == el,]$gene))
+}
+m = c(m, c2[grepl("LEIN_", names(c2))])
+m = m[!grepl("KLEIN", names(m))]
+m = c(m, c2[c("BHATTACHARYA_EMBRYONIC_STEM_CELL", "BOQUEST_STEM_CELL_DN", "BOQUEST_STEM_CELL_UP", "CONRAD_GERMLINE_STEM_CELL", "CONRAD_STEM_CELL",  "JINESH_BLEBBISHIELD_TRANSFORMED_STEM_CELL_SPHERES_DN", "JINESH_BLEBBISHIELD_TRANSFORMED_STEM_CELL_SPHERES_UP", "LEE_NEURAL_CREST_STEM_CELL_DN", "LEE_NEURAL_CREST_STEM_CELL_UP", "WONG_ADULT_TISSUE_STEM_MODULE", "WONG_EMBRYONIC_STEM_CELL_CORE", names(c2[grepl("glio", tolower(names(c2)))]))])
+m$codel1p19q = dropNA(c(res[grepl("q", tolower(res$band)) & res$chr == 19,"hgnc"], res[grepl("p", tolower(res$band)) & res$chr == 1,"hgnc"]))
+#m = lapply(m, function(el){return(el[el %in% cells_rankings@NAMES])})
+```
+
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+load(file = "integrated_3_SCT_RPCA.Rdata")
+```
+
+
+
+```{r}
+'setwd(paste0(wd, "/dt"))
+
+x = read.csv("markers_nature-2021.csv")
+
+n = list()
+for(el in colnames(x)){
+  n[[el]] = x[,el][!x[,el] == ""]
+  n[[el]] = intersect(n[[el]], rownames(scRNA@assays$RNA))
+}'
+```
+
+
+
+
+
+```{r}
+meta = data.frame(
+  cell = c("MGH36", "MGH53", "MGH54", "MGH60",
+           "MGH42",	"MGH43",	"MGH44",	"MGH45",	"MGH56",	"MGH57",	"MGH61",	"MGH64",	"MGH103",	"MGH107pos","MGH107neg",
+           "MGH66", "MGH100", "MGH101", "MGH102", "MGH104", "MGH105", "MGH106", "MGH110", "MGH113", "MGH115", "MGH121", "MGH122", "MGH124", "MGH125", "MGH126", "MGH128", "MGH129", "MGH136", "MGH143", "MGH151", "MGH152",
+           "GSM4119531", "GSM4119532", "GSM4119533" , "GSM4119534", "GSM4119535", "GSM4119536", "GSM4119537", "GSM4119538", "GSM4119539",
+           "BT_S2", "BT_S1", "BT_S4", "BT_S6"), #SF11979 SF11977 SF11956	SF11644	SF11136	SF12017	SF11964	SF11949	SF11612
+
+  experiment = c("GSE70630", "GSE70630", "GSE70630","GSE70630",
+                 "GSE89567",  "GSE89567",  "GSE89567",  "GSE89567",  "GSE89567",  "GSE89567",  "GSE89567",  "GSE89567",  "GSE89567",  "GSE89567", "GSE89567",
+                 rep("GSE131928", times = 21),
+                 "GSE138794", "GSE138794", "GSE138794", "GSE138794", "GSE138794", "GSE138794", "GSE138794", "GSE138794", "GSE138794",
+                 "GSE84465", "GSE84465", "GSE84465", "GSE84465"), 
+  IDH = c("mut", "mut", "mut", "mut",
+          "mut", "mut", "mut", "mut","mut", "mut", "mut", "mut","mut", "mut", "mut",
+          rep("wt", times = 21),
+          "wt","wt","wt","wt","mut","mut","mut","mut","mut",
+          "wt", "wt", "wt", "wt"),
+  histology = c("oligodendroglioma","oligodendroglioma","oligodendroglioma","oligodendroglioma",
+                "astrocytoma","astrocytoma","astrocytoma","GBM","astrocytoma","GBM","astrocytoma","astrocytoma","astrocytoma","astrocytoma","astrocytoma",
+                rep("GMB", times = 21),
+                "GBM",	"GBM",	"GBM",	"GBM",	"astrocytoma",	"astrocytoma",	"GBM",	"oligodendroglioma",	"oligodendroglioma",
+                "GBM", "GBM", "GBM", "GBM"),
+  grade = c(2,2,2,2,
+            3,3,3,4,3,4,3,3,3,2,2,
+            rep(4, times = 21),
+            4,4,4,4,2,2,4,3,NA,
+            4, 4, 4, 4),
+  recurrent = c("no","no","no","no",
+                "no", "yes","no","yes","no","no","no","no","no","no","no",
+                rep("no", times = 21),
+                "no","no","no","no","no","no", "no","no","yes",
+                "no", "no", "no", "no"),
+  age = c(NA,NA,NA,NA,
+          47,45,32,32,31,42,24,40,26,47,47,
+          67, 71, 52, 65, 65, 67, 66, 61, 65, 69, 63, 63, 68, 76, 65, 65, 78, 71, 62, 65, 52, 
+          76,	61,	63,	57,	34,	44,	64,	40,	67,
+          54, 55, 60, 48),
+  gender = c(NA,NA,NA,NA,
+             "female",	"male",	"male",	"female",	"male",	"male",	"male",	"female",	"female",	"female","female",
+             "male", "female", "male", "male", "female", 
+"female", "male", "male", "male", "female", "male", "male", "female", "male", "male", "female", "male", "male", "male", "male", "male", 
+             "female",	"female","male","male","male","male","male","male","male",
+             NA, NA, NA, NA)
+)
+
+meta
+
+for(el in colnames(meta)){
+  scRNA[[el]] = meta[match(scRNA[[]]$orig.ident, meta$cell),el]
+}
+
+scRNA$cell = gsub("pos", "", gsub("neg", "", scRNA[[]]$cell))
+unique(scRNA$cell)
+```
+
+
+
+
+```{r}
+#FULL_SET
+```
+
+
+```{r}
+dim = 200
+
+x = VariableFeatures(scRNA)
+
+DefaultAssay(scRNA) = "SCT"
+
+VariableFeatures(scRNA) = x
+
+#VariableFeatures()
+scRNA = RunPCA(scRNA, assay = "SCT", features = VariableFeatures(scRNA), reduction.name = "PCA_RNA", npcs = dim)
+
+
+x = pcaMarchenkoPastur(M = length(VariableFeatures(scRNA)), N = dim(scRNA)[2], pca.sdev = scRNA@reductions$PCA_RNA@stdev, factor = 1)
+sum(!x)
+dims = (1:dim)[x]
+
+scRNA = RunUMAP(scRNA, reduction = "PCA_RNA", assay = "SCT", dims = dims, reduction.name = "UMAP_RNA")
+```
+
+
+
+
+
+```{r}
+scRNA <- FindNeighbors(scRNA, dims = dims, assay = "SCT", reduction = "PCA_RNA")
+for(el in 1:20/10){
+  scRNA <- FindClusters(scRNA, resolution = el, assay = "SCT", reduction = "PCA_RNA")
+}
+
+el="SCT_snn_res.0.5"
+DimPlot(scRNA,group.by = el, pt.size = 1, reduction = "UMAP_RNA", label = T) + scale_color_manual(values = alpha(rainbow(length(unique(dropNA(scRNA[[]][,el])))), 0.5), na.value = "gray")
+```
+
+
+```{r}
+p = list()
+for(el in c("CD24", "PTPRC", "MBP", "CLU", "SNAP25", "SCG2", "ACTA2", "APOLD1", "GPR17")){
+  if(el %in% rownames(scRNA@assays$integrated@data)){
+    p[[el]] = gexp(scRNA = scRNA, gene = el, reduction = "UMAP_RNA")
+  }
+}
+
+p
+```
+
+
+
+
+```{r}
+el="SCT_snn_res.0.5"
+DimPlot(scRNA,group.by = el, pt.size = 1, reduction = "UMAP_RNA", label = T) + scale_color_manual(values = alpha(rainbow(length(unique(dropNA(scRNA[[]][,el])))), 0.5), na.value = "gray")
+```
+
+```{r}
+x = xtabs(~SCT_snn_res.0.5 + prim_ident, data = scRNA[[]])
+x = x/rowSums(x) > 0.6
+X = setNames(rep("unknown", times = length(unique(scRNA$SCT_snn_res.0.5))), unique(scRNA$SCT_snn_res.0.5))
+for(el in names(X)){
+  if(length(colnames(x)[x[el,]])>0){
+    X[el] = colnames(x)[x[el,]]
+  }
+}
+
+scRNA$dom_clust = X[as.character(scRNA$SCT_snn_res.0.5)]
+
+el="dom_clust"
+DimPlot(scRNA,group.by = el, pt.size = 1, reduction = "UMAP_RNA", label = T) + scale_color_manual(values = alpha(rainbow(length(unique(dropNA(scRNA[[]][,el])))), 0.5), na.value = "gray")
+```
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+'setwd(paste0(wd, "/scRNA_res"))
+df = scRNA[[]]
+for(el in dropNA(unique(scRNA$prim_ident))){
+  df[,el] = ifelse(df$prim_ident == el, 1, 0)
+  p = clustree(df, prefix = "integrated_snn_res.", node_colour = el, node_colour_aggr = "mean") + scale_color_gradientn(colors = rev(hcl.colors(9, "heat"))) + ggtitle(el)
+  ggsave(p, filename = paste0("Clustree_", el, ".png"), width = 10, height = 8, dpi = 400)
+}'
+```
+
+
+```{r}
+Idents(scRNA) = scRNA$SCT_snn_res.0.5
+setwd(paste0(wd, "/scRNA_res"))
+x = markers
+x = x[x$gene %in% rownames(scRNA),]
+x = x[!grepl("MDSC", toupper(x$group)),]
+
+p = DotPlot(scRNA, features = unique(as.character(x$gene)), assay = "SCT", cols = "RdYlBu")
+
+p$data$group = factor(x$group[match(p$data$features.plot, x$gene)], levels = unique(x$group))
+
+p = p + facet_grid(. ~ group, drop = T, scales = "free_x", space = "free_x") +theme(strip.text.x = element_text(angle=90), axis.text.x = element_text(angle=90, vjust=1))
+  
+
+
+ggsave(plot = p, filename = "scRNA_clusters_markers.png", width = 16, height = 16)
+```
+
+
+
+```{r}
+'library(biomaRt)
+mart <- useMart("ENSEMBL_MART_ENSEMBL", host = "ensembl.org")
+ensembl = useDataset("hsapiens_gene_ensembl",mart=mart)
+
+trl = getBM(attributes=c("ensembl_gene_id","hgnc_symbol", "entrezgene_id", "start_position", "end_position", "chromosome_name", "band", "strand", "description","phenotype_description", "mim_morbid_description"), mart= ensembl)
+trl$chromosome_name[nchar(trl$chromosome_name)>3] = gsub("_", "", substr(trl$chromosome_name[nchar(trl$chromosome_name)>3], 10, 11))'
+```
+
+```{r}
+scRNA$orig.ident = gsub("pos", "", gsub("neg", "", scRNA$orig.ident))
+```
+
+
+```{r}
+c("MGH60", "MGH54", "MGH53", "MGH36", "MGH42", "MGH61", "MGH43", "MGH45", "MGH44", "MGH56", "MGH64", "MGH57", "MGH107", "MGH102", "MGH104", "MGH105", "MGH110", "MGH113", "MGH121", "MGH122", "MGH124", "MGH125", "MGH136", "MGH143", "MGH66")
+```
+
+```{r}
+citation("Seurat")
+```
+
+
+
+```{r}
+'set.seed(2021)
+for(smpl in unique(scRNA$orig.ident)){ 
+
+  setwd(paste0(wd, "/scRNA_res/infercnv"))
+  
+  if (file.exists(smpl)){
+      setwd(paste0(wd, "/scRNA_res/infercnv/", smpl))
+  } else {
+      dir.create(paste0(wd, "/scRNA_res/infercnv/", smpl))
+      setwd(paste0(wd, "/scRNA_res/infercnv/", smpl))
+  
+  }
+  
+  scRNA$sel = ifelse(scRNA$orig.ident == smpl, 1, 0)
+  
+  sum(scRNA$sel)
+  
+  if(sum(scRNA$prim_ident[scRNA$sel == 1] == "immune") < 20){
+    x = table(scRNA[[]][scRNA$experiment == scRNA$experiment[match(smpl, scRNA[[]]$orig.ident)] & scRNA$prim_ident == "immune","orig.ident"])
+    
+    scRNA$sel[sample((1:length(scRNA$orig.ident))[scRNA$prim_ident == "immune" & scRNA$orig.ident == sample(names(x[x>=20]), 1)], 20)] = 1
+  }
+  
+  sum(scRNA$sel)
+  
+  if(sum(scRNA$prim_ident[scRNA$sel == 1] == "oligodendroglia") < 20){
+        x = table(scRNA[[]][scRNA$experiment == scRNA$experiment[match(smpl, scRNA[[]]$orig.ident)] & scRNA$prim_ident == "oligodendroglia","orig.ident"])
+    
+    scRNA$sel[sample((1:length(scRNA$orig.ident))[scRNA$prim_ident == "oligodendroglia" & scRNA$orig.ident == sample(names(x[x>=20]), 1)], 20)] = 1
+  }
+  
+  sum(scRNA$sel)
+  
+  library(infercnv)
+  
+  infercnv_obj = subset(scRNA, sel == 1)
+  
+  
+  X = infercnv_obj@assays$RNA@counts
+  #X = as.sparse(10*((2^(X))-1))
+  X = X[!is.na(match(rownames(X), trl$hgnc_symbol)),]
+  
+  x = trl[match(rownames(X), trl$hgnc_symbol),]
+  x$chr = paste0("chr", x$chromosome_name)
+  x$x = gsub("X", "23", x$chromosome_name)
+  x$x = gsub("Y", "24", x$chromosome_name)
+  x$x = as.numeric(x$x)
+  x = x[!x$x==0,]
+  x = x[!is.na(x$x),]
+  x$x = x$start_position + x$x*max(x$start_position)
+  x = x[order(x$x, decreasing = F),]
+  
+  
+  x = x[x$hgnc_symbol %in% rownames(X),]
+  X = X[rownames(X) %in% x$hgnc_symbol ,]
+  
+  dim(x)
+  dim(X)
+  
+  
+  
+  rownames(x) = x$hgnc_symbol
+  x = x[,c("chromosome_name", "start_position", "end_position")]
+  colnames(x) = c("V2", "V3", "V4")
+  
+  
+  
+  
+  el = paste(ifelse(infercnv_obj$prim_ident == "immune", "immune", ifelse(infercnv_obj$prim_ident == "oligodendroglia", "oligodendroglia", "glioma")), infercnv_obj$orig.ident, sep = "_")
+  
+  el = data.frame(row.names = rownames(infercnv_obj[[]]), V2 = el)
+  
+  print(table(el$V2))
+  
+  library(infercnv)
+  infercnv_obj = CreateInfercnvObject(
+    raw_counts_matrix=X,
+    annotations_file=el,
+    gene_order_file=x,
+    ref_group_names= unique(el$V2[!grepl("glioma", el$V2)]))
+  
+  save(infercnv_obj, file = "infercnv_obj.Rdata")
+}'
+```
+
+
+
+
+
+```{r}
+'wd = "D:/Files/Main_directory/Nencki/Epilepsy_2020"
+library(parallel)
+library(infercnv)
+for(smpl in rev(c("MGH60", "MGH54", "MGH53", "MGH36", "MGH42", "MGH61", "MGH43", "MGH45", "MGH44", "MGH56", "MGH64", "MGH57", "MGH107", "MGH102", "MGH104", "MGH105", "MGH110", "MGH113", "MGH121", "MGH122", "MGH124", "MGH125", "MGH136", "MGH143", "MGH66"))){
+  print(smpl)
+  setwd(paste0(wd, "/scRNA_res/infercnv/", smpl))
+  load(file = "infercnv_obj.Rdata")
+  
+  infercnv_obj = infercnv::run(
+    infercnv_obj,
+    cutoff=0.75, # cutoff=1 works well for Smart-seq2, and cutoff=0.1 works well for 10x Genomics
+    out_dir=paste0(wd, "/scRNA_res/infercnv/", smpl),
+    cluster_by_groups=TRUE, 
+    plot_steps=FALSE,
+    denoise=TRUE,
+    HMM=T,
+    analysis_mode = "subclusters",
+    tumor_subcluster_partition_method = "qnorm",
+    no_prelim_plot=TRUE,
+    HMM_report_by = "cell",
+    png_res=300
+  )
+  
+  save(infercnv_obj, file = "infercnv_res.Rdata")
+  rm(list = "infercnv_obj")
+  gc()
+
+}'
+```
+
+
+```{r}
+library(infercnv)
+wd = getwd()
+
+x = setNames(rep(NA, times = length(colnames(scRNA))), colnames(scRNA))
+
+for(smpl in c("MGH60", "MGH54", "MGH53", "MGH36", "MGH42", "MGH61", "MGH43", "MGH45", "MGH44", "MGH56", "MGH64", "MGH57", "MGH107", "MGH102", "MGH104", "MGH110", "MGH113", "MGH121", "MGH122", "MGH124", "MGH125", "MGH136", "MGH143", "MGH66", "MGH105")){
+  print(smpl)
+  setwd(paste0(wd, "/scRNA_res/infercnv/", smpl))
+  load(file = "infercnv_res.Rdata")
+  MGH = subset(scRNA, cells = colnames(infercnv_obj@expr.data))
+  
+  MGH = add_to_seurat(seurat_obj = MGH, infercnv_output_path = paste0(wd, "/scRNA_res/infercnv/", smpl))
+  
+  smpl = (rowSums(MGH[[]][,grep("top_", colnames(MGH[[]]))])/max(rowSums(MGH[[]][,grep("top_", colnames(MGH[[]]))])))[MGH$orig.ident == smpl]
+  
+  x[names(smpl)] = smpl
+}
+
+x[is.na(x)]
+
+```
+
+
+```{r}
+scRNA$CNA = x[rownames(scRNA[[]])]
+
+FeaturePlot(scRNA, features = "CNA", reduction = "UMAP_RNA")
+```
+
+```{r}
+DimPlot(scRNA, group.by = "experiment", reduction = "UMAP_RNA")
+```
+
+
+
+
+
+```{r}
+p = list()
+
+#p[["clusters"]] = DimPlot(scRNA,group.by = "identity", pt.size = 1, reduction = "umap", label = T) + scale_color_manual(values = alpha(rainbow(length(unique(dropNA(scRNA[[]][,"identity"])))), 0.5), na.value = "gray")
+
+for(el in c("CD24", "PTPRC", "MBP", "CLU", "SNAP25", "SCG2", "ACTA2", "APOLD1", "GPR17")){
+  if(el %in% rownames(scRNA@assays$integrated@data)){
+    p[[el]] = gexp(scRNA = scRNA, gene = el, reduction = "UMAP_RNA")
+  }
+}
+
+p
+```
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+scRNA$identity = ifelse(scRNA@reductions$UMAP_RNA@cell.embeddings[,"UMAP_1"] > (5), "immune", ifelse(scRNA@reductions$UMAP_RNA@cell.embeddings[,"UMAP_2"] > (5) , "oligodendroglia", "glioma"))
+                        
+el="identity"
+DimPlot(scRNA,group.by = el, pt.size = 1, reduction = "UMAP_RNA", label = T) + scale_color_manual(values = alpha(rainbow(length(unique(dropNA(scRNA[[]][,el])))), 0.5), na.value = "gray")                        
+```
+
+
+
+
+```{r}
+p = list()
+
+p[["clusters"]] = DimPlot(scRNA,group.by = "identity", pt.size = 1, reduction = "UMAP_RNA", label = T) + scale_color_manual(values = alpha(rainbow(length(unique(dropNA(scRNA[[]][,"identity"])))), 0.5), na.value = "gray")
+
+for(el in c("CD24", "PTPRC", "MBP", "CLU", "SNAP25", "SCG2", "ACTA2", "APOLD1", "GPR17")){
+  if(el %in% rownames(scRNA@assays$integrated@data)){
+    p[[el]] = gexp(scRNA = scRNA, gene = el, reduction = "UMAP_RNA")
+  }
+}
+
+
+setwd(paste0(wd, "/scRNA_res"))
+
+ggsave(plot = ggarrange(plotlist = p, ncol = 2, nrow = 4),width = 14, height = 20, filename = "identity_markers_expression.png", dpi = 400)
+```
+
+```{r}
+'f = function(x){
+  x = (x-min(x))/(max(x) - min(x))
+}
+
+DefaultAssay(scRNA) = "AUC_m"
+
+el="CE-EPILEPSY-UP"
+FeaturePlot(scRNA,features = el, pt.size = 1, reduction = "umap") + scale_color_gradientn(colors = c("cyan","blue", "gray20", "red", "orange"), values = f(quantile(scRNA@assays$AUC_m@counts[el,])))
+
+el="REST"
+FeaturePlot(scRNA,features = el, pt.size = 1, reduction = "umap") + scale_color_gradientn(colors = c("cyan","blue", "gray20", "red", "orange"), values = f(quantile(scRNA@assays$AUC_m@counts[el,])))
+
+DefaultAssay(scRNA) = "integrated"'
+```
+
+
+
+```{r}
+scRNA = AddModuleScore(scRNA, features =  m["REST"] , name = "NRSF", ctrl = 100, assay = "SCT")
+scRNA = AddModuleScore(scRNA, features =  m["CE_EPILEPSY_UP"] , name = "Epilepsy", ctrl = 100, assay = "SCT")
+scRNA = AddModuleScore(scRNA, features =  m["CE_EPILEPSY_DN"] , name = "Epilepsy_neg", ctrl = 100, assay = "SCT")
+```
+
+```{r}
+scRNA$GAE = scRNA$Epilepsy1 - scRNA$Epilepsy_neg1
+```
+
+
+
+
+```{r}
+p = list()
+
+df = data.frame(UMAP1 = scRNA@reductions$UMAP_RNA@cell.embeddings[,"UMAP_1"],
+                UMAP2 = scRNA@reductions$UMAP_RNA@cell.embeddings[,"UMAP_2"],
+                identity = scRNA$identity,
+                #REST = scRNA@assays$AUC_m@counts["REST",],
+                #Epilepsy = scRNA@assays$AUC_m@counts["CE-EPILEPSY-UP",],
+                REST = scRNA$NRSF1,
+                Epilepsy = scRNA$GAE)
+
+
+```
+
+```{r}
+p[["identity"]] = ggplot(data = df, aes(x = UMAP1, y = UMAP2, color = identity)) +
+  geom_point() + scale_color_manual(name = "Cell\nidentity", values = alpha(c("seashell4", "darkturquoise", "darkgreen", "darkgoldenrod1", "tomato", "darkorchid4"),0.5), breaks = c("glioma", "astrocyte", "oligodendroglia", "neuron", "vascular", "immune"), labels = c("neoplastic", "astrocyte", "oligodendrocyte", "neuron", "vascular", "immune")) + theme_classic() + labs(title = "Identified cellular populations", x = "UMAP 1", y = "UMAP 2") + 
+  theme(axis.ticks.x = element_blank(), axis.text.x = element_blank(), axis.line.x = element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank(), axis.line.y = element_blank())
+
+p[["identity"]]
+```
+
+```{r}
+el
+```
+
+
+```{r}
+p[["correlation"]] = ggplot(data = df, mapping = aes(x = REST, y = Epilepsy, color = identity)) +
+  geom_point() + scale_color_manual(name = "Cell\nidentity", values = alpha(c("seashell4", "darkgreen","darkorchid4"),0.5), breaks = c("glioma", "oligodendroglia", "immune"), labels = lapply(c("glioma", "oligodendroglia", "immune"), function(el){
+  x = cor.test(df[df$identity == el,]$REST, df[df$identity == el,]$Epilepsy)
+  return(paste0(el, "\ncoef = ", signif(x$estimate,3), "\np = ", signif(x$p.value,3), "\n"))
+})) +
+  geom_smooth(data = df, mapping = aes(x = REST, y = Epilepsy), inherit.aes = F, size = 1, color = "black", method = lm, linetype = "dashed", se = F) +
+  theme_classic() + labs(title = "Correlation of Seurat signatures", subtitle = paste0("Pearson correlation: coefficient = ", signif(cor.test(df$REST, df$Epilepsy)$estimate,3), ", p-value = ", signif(cor.test(df$REST, df$Epilepsy)$p.value,3)),  x = "REST regulated genes signature", y = "GAE signature")
+
+p[["correlation"]]
+```
+
+
+```{r}
+f = function(x){
+  x = (x-min(x))/(max(x) - min(x))
+}
+
+x = setNames(c(quantile(df$REST[df$identity=="glioma"]), min(df$REST), max(df$REST)), c("dodgerblue", "cyan",  "gray70", "yellow", "red",  "blue4", "magenta4"))
+
+x = x[!duplicated(x)]
+
+x = x[order(x)]
+
+p[["REST"]] = ggplot(data = df, aes(x = UMAP1, y = UMAP2, color = REST)) +
+  geom_point() + scale_color_gradientn(colors = alpha(names(x),0.5), values = f(x), name = "Seurat\nscore") +theme_classic() + labs(title = "REST regulated genes signature", x = "UMAP 1", y = "UMAP 2") + 
+  theme(axis.ticks.x = element_blank(), axis.text.x = element_blank(), axis.line.x = element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank(), axis.line.y = element_blank())
+
+p[["REST"]]
+```
+
+
+```{r}
+x = setNames(c(quantile(df$Epilepsy[df$identity=="glioma"]), min(df$Epilepsy), max(df$Epilepsy)), c("dodgerblue", "cyan",  "gray70", "yellow", "red",  "blue4", "magenta4")) 
+
+x = x[!duplicated(x)]
+
+x = x[order(x)]
+
+p[["Epilepsy"]] = ggplot(data = df, aes(x = UMAP1, y = UMAP2, color = Epilepsy)) +
+  geom_point() + scale_color_gradientn(colors = alpha(names(x),0.5), values = f(x), name = "Seurat\nscore") +theme_classic()  + labs(title = "Genes upregulated in epilepsy signature", x = "UMAP 1", y = "UMAP 2") + 
+  theme(axis.ticks.x = element_blank(), axis.text.x = element_blank(), axis.line.x = element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank(), axis.line.y = element_blank())
+
+p[["Epilepsy"]]
+```
+
+
+
+
+
+```{r}
+fig3.1 = p
+setwd(paste0(wd, "/Figures"))
+ggsave(ggarrange(plotlist = fig3.1, ncol = 2, nrow = 2), filename = "Fig3.1.png", width = 16, height = 10, dpi = 400)
+
+save(fig3.1, file = "fig3.1.Rdata")
+```
+
+
+
+
+
+
+
+
+
+
+```{r}
+### Glioma subset
+```
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+load(file = "scRNA_SCT_RPCA_identified.Rdata")
+```
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+load(file = "ig.Rdata")
+```
+
+
+```{r}
+Idents(scRNA) = scRNA$identity
+glioma = subset(scRNA, idents = "glioma")
+rm(list = "scRNA")
+gc()
+```
+
+
+
+```{r}
+DefaultAssay(glioma) = "integrated"
+glioma = FindVariableFeatures(glioma, nfeatures = 3000)
+```
+
+```{r}
+dim = 200
+
+glioma = RunPCA(glioma, npcs = dim, features = VariableFeatures(glioma)) 
+
+x = pcaMarchenkoPastur(M = length(VariableFeatures(glioma)), N = dim(glioma)[2], pca.sdev = glioma@reductions$pca@stdev, factor = 1)
+dims = (1:dim)[x]
+
+range(dims)
+
+glioma <- RunUMAP(glioma, dims = dims, reduction = "pca")
+```
+
+```{r}
+el="Phase"
+DimPlot(glioma,group.by = el, pt.size = 1, reduction = "umap", label = F) + scale_color_manual(values = alpha(rainbow(length(unique(dropNA(glioma[[]][,el])))), 0.5), na.value = "gray")
+```
+
+```{r}
+el="experiment"
+DimPlot(glioma,group.by = el, pt.size = 1, reduction = "umap", label = F) + scale_color_manual(values = alpha(rainbow(length(unique(dropNA(glioma[[]][,el])))), 0.5), na.value = "gray")
+```
+
+
+```{r}
+el= "prim_ident"
+DimPlot(glioma,group.by = el, pt.size = 1, reduction = "umap", label = F) + scale_color_manual(values = alpha(rainbow(length(unique(dropNA(glioma[[]][,el])))), 0.5), na.value = "gray")
+```
+
+
+```{r}
+glioma <- FindNeighbors(glioma, dims = dims)
+for(el in 1:20/10){
+  glioma <- FindClusters(glioma, resolution = el)
+}
+```
+
+
+```{r}
+el="integrated_snn_res.0.5"
+DimPlot(glioma,group.by = el, pt.size = 1, reduction = "umap", label = T) + scale_color_manual(values = alpha(rainbow(length(unique(dropNA(glioma[[]][,el])))), 0.5), na.value = "gray")
+```
+
+```{r}
+p = list()
+
+df = data.frame(UMAP1 = glioma@reductions$UMAP_RNA@cell.embeddings[,1],
+                UMAP2 = glioma@reductions$UMAP_RNA@cell.embeddings[,2],
+                identity = glioma$identity,
+                #REST = glioma@assays$AUC_m@counts["REST",],
+                #Epilepsy = glioma@assays$AUC_m@counts["CE-EPILEPSY-UP",],
+                REST = glioma$NRSF1,
+                Epilepsy = glioma$GAE)
+
+
+```
+
+
+```{r}
+f = function(x){
+  x = (x-min(x))/(max(x) - min(x))
+}
+
+x = setNames(c(quantile(df$REST[df$identity=="glioma"]), min(df$REST), max(df$REST)), c("dodgerblue", "cyan",  "gray70", "yellow", "red",  "blue4", "magenta4"))
+
+x = x[!duplicated(x)]
+
+x = x[order(x)]
+
+p[["REST"]] = ggplot(data = df, aes(x = UMAP1, y = UMAP2, color = REST)) +
+  geom_point() + scale_color_gradientn(colors = alpha(names(x),0.5), values = f(x), name = "Seurat\nscore") +theme_classic() + labs(title = "REST regulated genes signature", x = "UMAP 1", y = "UMAP 2") + 
+  theme(axis.ticks.x = element_blank(), axis.text.x = element_blank(), axis.line.x = element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank(), axis.line.y = element_blank())
+
+p[["REST"]]
+```
+
+
+```{r}
+x = setNames(c(quantile(df$Epilepsy[df$identity=="glioma"]), min(df$Epilepsy), max(df$Epilepsy)), c("dodgerblue", "cyan",  "gray70", "yellow", "red",  "blue4", "magenta4")) 
+
+x = x[!duplicated(x)]
+
+x = x[order(x)]
+
+p[["Epilepsy"]] = ggplot(data = df, aes(x = UMAP1, y = UMAP2, color = Epilepsy)) +
+  geom_point() + scale_color_gradientn(colors = alpha(names(x),0.5), values = f(x), name = "Seurat\nscore") +theme_classic()  + labs(title = "Genes upregulated in epilepsy signature", x = "UMAP 1", y = "UMAP 2") + 
+  theme(axis.ticks.x = element_blank(), axis.text.x = element_blank(), axis.line.x = element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank(), axis.line.y = element_blank())
+
+p[["Epilepsy"]]
+```
+
+```{r}
+for(el in names(m)[grepl("VERHAAK", names(m))]){
+  glioma = AddModuleScore(glioma, features =  m[el] , name = el, ctrl = 100, assay = "SCT")
+}
+
+
+```
+
+
+```{r}
+x = glioma[[]][,grepl("VERHAAK", colnames(glioma[[]]))]
+x$grade = glioma$grade
+#x$grade = 4
+for(el in rownames(glioma@assays$AUC_m)[grepl("VERHAAK", rownames(glioma@assays$AUC_m))]){
+  x[,el] = (x[,el] - median(x[x$grade==4,el]))/sd(x[x$grade==4,el])
+}
+
+x$type = as.character(apply(as.matrix(x[,1:4]), 1, function(el){
+  colnames(x)[which.max(el)]
+}))
+
+x$type[rowSums(as.matrix(x[,1:4])<0) == 4] = "none"
+
+x$type = gsub("VERHAAK_GLIOBLASTOMA_", "", x$type)
+x$type = gsub("1", "", x$type)
+
+x
+
+glioma$Verhaak_p = tolower(x$type)
+glioma$Verhaak = glioma$Verhaak_p
+#glioma$Verhaak[glioma$integrated_snn_res.0.5 %in% c("3", "5")] = "none"
+```
+
+
+```{r}
+```
+
+```{r}
+unique(glioma$Verhaak)
+```
+
+
+```{r}
+df = data.frame(Verhaak = glioma$Verhaak, REST = glioma$NRSF1, GAE = glioma$GAE)
+
+ggplot(data = df, mapping = aes(x = REST, y = GAE, color = Verhaak)) +
+  geom_point() +
+  scale_color_manual(name = "Cells subtype\nby Verhaak et al.", values = alpha(c("green","orange", "blue", "purple", "gray"), 0.5), breaks = c("neural","proneural", "classical", "mesenchymal", "none"), labels = c("neural", "proneural", "classical", "mesenchymal", "none")) +
+  theme_classic()
+```
+
+```{r}
+library(scatterpie)
+library(ggrepel)
+setwd(paste0(wd, "/scRNA_res"))
+
+x = xtabs(~orig.ident + Verhaak, data = glioma[[]])
+attr(x, "class") <- NULL
+attr(x, "call") <- NULL
+x = as.data.frame(x)
+
+x$x = tapply(glioma$NRSF1 , glioma[[]]$orig.ident, mean)[rownames(x)]
+x$y = tapply(glioma$GAE , glioma$orig.ident, mean)[rownames(x)]
+x$label = paste0(ifelse(glioma[[]][match(rownames(x), glioma[[]]$orig.ident),"grade"] == 4, "GBM", ifelse(glioma[[]][match(rownames(x), glioma[[]]$orig.ident),"histology"] == "oligodendroglioma", "OG", "AS")), paste0(", G", glioma[[]][match(rownames(x), glioma[[]]$orig.ident),"grade"]), ", IDH-", glioma[[]][match(rownames(x), glioma[[]]$orig.ident),"IDH"])
+
+x$molecular = ifelse(rownames(x) %in% c("MGH60", "MGH36", "MGH54", "MGH53"), "IDHmut, 1p19q-codel", ifelse(rownames(x) %in% c("MGH60", "MGH36", "MGH54", "MGH53"), "IDHmut, 1p19q-codel", ifelse(glioma[[]][match(rownames(x), glioma[[]]$orig.ident),"IDH"] == "mut", "IDHmut", "IDHwt")))
+
+x$idh = glioma[[]][match(rownames(x), glioma[[]]$orig.ident),"IDH"]
+x
+
+p = list()
+p[["c1"]] = ggplot() +
+  geom_text_repel(data = x, aes(x = x, y = y, label = label, color = molecular), ylim = c(0.05, NA), angle = 90, direction = "x") +
+  #geom_mark_ellipse(aes(x = x, y = y, filter = idh == 'mut', label = 'IDH-mutated'), data = x, color = "darkgoldenrod", size = 1) +
+  #geom_mark_ellipse(aes(x = x, y = y, filter = idh == 'wt', label = 'IDH-wild type'), data = x, color = "cyan", size = 1) +
+  geom_scatterpie(aes(x=x, y=y), data = x, color = NA, cols=c("neural","proneural", "classical", "mesenchymal", "none"), pie_scale = 1.5) +
+  scale_fill_manual(name = "Cells subtype\nby Verhaak et al.", values = c("green","orange", "blue", "purple", "gray"), breaks = c("neural","proneural", "classical", "mesenchymal", "none"), labels = c("neural", "proneural", "classical", "mesenchymal", "none")) +
+  scale_color_manual(values = c("cyan4","darkgoldenrod", "brown"), breaks = c("IDHwt","IDHmut", "IDHmut, 1p19q-codel"), guide_legend(title.position = "none")) +
+  #scale_colour_manual(name = "IDH status", breaks = c("wt","mut"), labels = c("Wild-type", "Mutated"), values = c("cyan", "darkgoldenrod")) +
+  coord_equal() + theme_classic() + expand_limits(y = 0.13)+ guides(color = "none") +
+  labs(title = "Samples in single cell experiments", subtitle = "Only glioma cells selected", x = "REST target genes mean score", y = "GAE genes mean score")
+
+#geom_text_repel(aes(x=x, y=y, label = label), data = x, nudge_x = 0.01) +
+
+ggsave(plot = p[["c1"]], filename = "t1.png", width = 7, height = 5)
+
+#ggsave(plot = p[["c1"]], filename = "Ver-cor.png", width = 8, height = 6)
+```
+
+
+
+
+
+
+
+
+```{r}
+df = data.frame(UMAP1 = glioma@reductions$umap@cell.embeddings[,1],
+                UMAP2 = glioma@reductions$umap@cell.embeddings[,2],
+                #UMAP1 = glioma@reductions$umap2@cell.embeddings[,"umap2_1"],
+                #UMAP2 = glioma@reductions$umap2@cell.embeddings[,"umap2_2"],
+                #identity = glioma$identity,
+                REST = glioma$NRSF1,
+                Epilepsy = glioma$GAE,
+                #Epilepsy_dn = glioma$Epilepsy_neg1,
+                PN = glioma$VERHAAK_GLIOBLASTOMA_PRONEURAL1,
+                MS = glioma$VERHAAK_GLIOBLASTOMA_MESENCHYMAL1)
+```
+
+```{r}
+el = data.frame(label = c("mesenchymal", "proneural"), y = min(df$Epilepsy), x = c(min(df$PN-df$MS) + 0.1*(max(df$PN-df$MS) -min(df$PN-df$MS)), max(df$PN-df$MS) - 0.1*(max(df$PN-df$MS) -min(df$PN-df$MS))))
+
+el
+```
+
+
+
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+
+f = function(x){
+  x = (x-min(x))/(max(x) - min(x))
+}
+
+x = setNames(c(quantile(df$REST), min(df$REST), max(df$REST)), c("dodgerblue", "cyan",  "gray70", "yellow", "red",  "blue4", "magenta4"))
+
+x = x[!duplicated(x)]
+
+x = x[order(x)]
+
+p[["c2"]] = ggplot() +
+  geom_label(data = el, mapping = aes(x = x, y = y, fill = label, label = label)) +
+  geom_point(data = df, mapping = aes(x = PN-MS, y = Epilepsy, color = REST)) + 
+  scale_fill_manual(values = c("orange", "purple"), breaks = c("proneural","mesenchymal")) +
+  scale_color_gradientn(colors = alpha(names(x),0.5), values = f(x), name = "REST\ntargets\nSeurat\nsignature") +theme_classic() + labs(title = "Correlation of Seurat signatures", subtitle = paste0("Pearson correlation:\nVerhaak - Epilepsy: coefficient = ", signif(cor.test(df$PN - df$MS, df$Epilepsy)$estimate,3), ", p-value = ", signif(cor.test(df$PN - df$MS, df$Epilepsy)$p.value,3), "\nVerhaak - REST: coefficient = ", signif(cor.test(df$PN - df$MS, df$REST)$estimate,3), ", p-value = ", signif(cor.test(df$PN - df$MS, df$REST)$p.value,3)),  x = "Verhaak et al. signature", y = "GAE genes signature") + guides(fill = "none")
+
+p[["c2"]]
+
+ggsave(plot = p[["c2"]], filename = "Ver-cor2.png", width = 8, height = 6)
+```
+
+```{r}
+fig3.2 = p
+setwd(paste0(wd, "/Figures"))
+ggsave(ggarrange(plotlist = fig3.2, ncol = 2, nrow = 1), filename = "Fig3.2.png", width = 16, height = 5, dpi = 400)
+
+save(fig3.2, file = "fig3.2.Rdata")
+```
+
+```{r}
+setwd(paste0(wd, "/dt"))
+
+x = read.xlsx("subtypes_GSE131928.xlsx", sheetIndex = 1)
+
+n = list()
+for(el in c("MES", "AC", "OPC", "NPC")){
+  n[[el]] = unlist(x[,grepl(el, colnames(x))])
+  n[[el]] = intersect(n[[el]], rownames(glioma@assays$RNA))
+}
+```
+
+
+```{r}
+for(el in names(n)){
+  glioma = AddModuleScore(glioma, features =  n[el] , name = paste0("Suva_", el), ctrl = 100, assay = "SCT")
+}
+```
+
+
+```{r}
+x = glioma[[]][,grepl("Suva_", colnames(glioma[[]]))]
+x = x[,!grepl("21", colnames(x))]
+x = x[,!grepl("11", colnames(x))]
+x = x[,!grepl("G2.M", colnames(x))]
+x = x[,!grepl("G1.S", colnames(x))]
+
+
+for(el in colnames(x)){
+  x[,el] = (x[,el] - median(x[,el]))/sd(x[,el])
+}
+
+x$type = as.character(apply(as.matrix(x[,1:4]), 1, function(el){
+  colnames(x)[which.max(el)]
+}))
+
+x$type = gsub("1", "", x$type)
+x$type = gsub("Suva_", "", x$type)
+x$type[glioma$integrated_snn_res.0.5 %in% c("3", "5")] = "cycling"
+
+glioma$Suva = x$type
+```
+
+```{r}
+x
+```
+
+
+
+```{r}
+df = data.frame(Suva = glioma$Suva, REST = glioma$NRSF1, GAE = glioma$GAE)
+
+df[df$Suva == "cycling",]
+
+ggplot(data = df, mapping = aes(x = REST, y = GAE, color = Suva)) +
+  geom_point() +
+  theme_classic()
+```
+
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+df = glioma[[]]
+save(df, file = "glioma_md.Rdata")
+```
+
+```{r}
+x = c(,,,)
+### Back to all set
+```
+
+```{r}
+rm(list = "glioma")
+gc()
+setwd(paste0(wd, "/scRNA_res"))
+load(file = "scRNA_SCT_RPCA_identified.Rdata")
+load(file = "glioma_md.Rdata")
+load(file = "ig.Rdata")
+```
+
+
+
+
+
+
+
+```{r}
+'df = xtabs(~IDH + identity, data = scRNA[[]], exclude = F)
+df
+sapply(colnames(df), rep, times = nrow(df))
+df = data.frame(cell = unlist(lapply(colnames(df), rep, times = nrow(df))), idh = rep(rownames(df), times = ncol(df)), value = c(df), perc = c(100*df/rowSums(df)))
+df
+
+df$cell = factor(df$cell, levels = names(table(scRNA$identity)[order(table(scRNA$identity), decreasing = T)]))
+
+x = sapply(unique(df$cell), function(el){
+  table = matrix(c(sum(scRNA$identity==el & scRNA$IDH=="mut"), sum(scRNA$identity==el & scRNA$IDH=="wt"), sum((!(scRNA$identity==el)) & scRNA$IDH=="mut"), sum((!(scRNA$identity==el)) & scRNA$IDH=="wt")),nrow = 2)
+  fisher.test(table)$p.value
+})
+
+names(x) = unique(df$cell)
+
+x = p.adjust(x, method = "BH")
+
+x = data.frame(cell = names(x), padj = x, label = ifelse(x<0.0001, "***", ifelse(x<0.001, "**", ifelse(x<0.05, "*", ifelse(x<0.1, ".", "ns")))))
+
+x$pos = 2 + sapply(x$cell, function(el){max(df[df$cell==el,"perc"])})
+
+x$cell = factor(x$cell, levels = names(table(scRNA$identity)[order(table(scRNA$identity), decreasing = T)]))
+
+p = ggplot(data = df[!df$cell %in% c("glioma", "immune"),], aes(x = cell, y = perc, fill = idh)) +
+  geom_bar(stat = "identity", position=position_dodge()) + 
+  #geom_text(data = el, aes(x = cell, y = pos, label = label)) +
+  theme_classic() + scale_fill_manual(name = "IDH status:", breaks = c("mut", "wt"), labels = c("mutated", "wild-type"), values = c("darkgoldenrod", "cyan")) + scale_y_continuous(expand = c(0, 0),  name = "Percentage of cells") +  scale_x_discrete(breaks = c("astrocyte", "oligodendroglia", "neuron", "vascular"), labels = c("astrocyte", "oligodendrocyte", "neuron", "vascular"), name = "Cell type") + theme(legend.position = "none")
+
+Fig3_pop_idh = ggplot() +
+  geom_bar(data = df, aes(x = cell, y = perc, fill = idh), stat = "identity", position=position_dodge()) + 
+  geom_text(data = x, aes(x = cell, y = pos, label = label)) + 
+  geom_point(data = data.frame(x = "immune", y = 4+max(df$perc)), aes(x = x, y = y), color = "white") +
+  theme_classic() + scale_fill_manual(name = "IDH status:", breaks = c("mut", "wt"), labels = c("mutated", "wild-type"), values = c("darkgoldenrod", "cyan")) + scale_y_continuous(expand = c(0, 0), name = "Percentage of cells") +  scale_x_discrete(breaks = c("glioma", "immune", "astrocyte", "oligodendroglia", "neuron", "vascular"), labels = c("neoplastic", "immune", "astrocyte", "oligodendrocyte", "neuron", "vascular"), name = "Cell type") + annotation_custom(ggplotGrob(p), xmin = 2.5, xmax = Inf, ymin = 12, ymax = Inf) + ggtitle("IDH mutation effect on cellular glioma composition")
+
+Fig3_pop_idh
+
+setwd(paste0(wd, "/Figures"))
+ggsave(Fig3_pop_idh, filename = "Fig3_pop_idh.png", width = 7, height = 5, dpi = 400)
+
+save(Fig3_pop_idh, file = "Fig3_pop_idh.Rdata")'
+```
+
+```{r}
+p = list()
+
+df = data.frame(UMAP1 = scRNA@reductions$UMAP_RNA@cell.embeddings[,"UMAP_1"],
+                UMAP2 = scRNA@reductions$UMAP_RNA@cell.embeddings[,"UMAP_2"],
+                identity = scRNA$identity,
+                #REST = scRNA@assays$AUC_m@counts["REST",],
+                #Epilepsy = scRNA@assays$AUC_m@counts["CE-EPILEPSY-UP",],
+                REST = scRNA$NRSF1,
+                Epilepsy = scRNA$GAE,
+                CNA = 100*scRNA$CNA )
+
+
+```
+
+```{r}
+f = function(x){
+  (x - min(x))/(max(x) - min(x))
+}
+
+
+p[["identity"]] = ggplot(data = df, aes(x = UMAP1, y = UMAP2, color = identity)) +
+  geom_point() + scale_color_manual(name = "Cell\nidentity", values = alpha(c("seashell4", "darkturquoise", "darkgreen", "darkgoldenrod1", "tomato", "darkorchid4"),0.5), breaks = c("glioma", "astrocyte", "oligodendroglia", "neuron", "vascular", "immune"), labels = c("neoplastic", "astrocyte", "oligodendrocyte", "neuron", "vascular", "immune")) + theme_classic() + labs(title = "Identified cellular populations", x = "UMAP 1", y = "UMAP 2") + 
+  theme(axis.ticks.x = element_blank(), axis.text.x = element_blank(), axis.line.x = element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank(), axis.line.y = element_blank())
+
+p[["identity"]]
+```
+```{r}
+f = function(x){
+  x = (x-min(x))/(max(x) - min(x))
+}
+
+x = setNames(c(0, quantile(df$CNA[!df$CNA==0])), c("gray70", "cyan",  "blue", "purple", "magenta4",  "red"))
+
+x = x[!duplicated(x)]
+
+x = x[order(x)]
+
+p[["CNA"]] = ggplot(data = df, aes(x = UMAP1, y = UMAP2, color = CNA)) +
+  geom_point() + scale_color_gradientn(colors = alpha(names(x),0.5), values = f(x), name = "Percent\nof CNAs") +theme_classic() + labs(title = "Top CNAs identified in samples", x = "UMAP 1", y = "UMAP 2") + 
+  theme(axis.ticks.x = element_blank(), axis.text.x = element_blank(), axis.line.x = element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank(), axis.line.y = element_blank())
+
+p[["CNA"]]
+```
+
+```{r}
+
+for(el in c("CD24", "PTPRC", "MBP", "CLU")){
+  if(el %in% rownames(scRNA@assays$integrated@data)){
+    p[[el]] = gexp(scRNA = scRNA, gene = el, reduction = "UMAP_RNA")
+  }
+}
+
+p
+```
+```{r}
+Fig3s = p[c("identity", "CNA", "PTPRC", "MBP", "CD24", "CLU")]
+
+setwd(paste0(wd, "/Figures/Supplementary"))
+#save(Fig3s, file = "Fig3s.rdata")
+ggsave(ggarrange(plotlist = Fig3s, nrow = 3, ncol = 2, labels = "auto"), width = 16, height = 18, filename = "Fig3s.png", dpi = 400)
+```
+
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+load(file = "glioma_md.Rdata")
+
+scRNA$identity_general = scRNA$identity
+
+scRNA$Verhaak_id = df[rownames(scRNA[[]]),"Verhaak"]
+
+scRNA$Verhaak_id[scRNA$identity_general == "immune"] = "immune"
+scRNA$Verhaak_id[scRNA$identity_general == "oligodendroglia"] = "oligodendroglia"
+
+unique(scRNA$Verhaak_id)
+```
+
+```{r}
+scRNA$Suva_id = df[rownames(scRNA[[]]),"Suva"]
+
+scRNA$Suva_id[scRNA$identity_general == "immune"] = "immune"
+scRNA$Suva_id[scRNA$identity_general == "oligodendroglia"] = "oligodendroglia"
+
+unique(scRNA$Suva_id)
+```
+
+```{r}
+scRNA$identity = scRNA$Suva_id
+
+library(tidyverse)
+library(tidyverse)
+library(ggplot2)
+
+x = quantile(scRNA$GAE, seq(0,1,0.2))
+x = sapply(scRNA$GAE, function(el){
+  sum(x > el)
+})
+x[x==0] = 1
+
+scRNA$QE = paste0("Q", x)
+
+df <- scRNA[[]] %>%
+  group_by(identity, QE) %>%
+  summarise(count = n()) %>%
+  mutate(identity.count = sum(count),
+         prop = 100*count/sum(count)) %>%
+  ungroup()
+
+df = as.data.frame(as.matrix(df))
+
+for(el in c("count", "identity.count", "prop")){
+  df[,el] = as.numeric(as.character(df[,el]))
+}
+
+df$identity.count = df$identity.count + 0.2*max(df$identity.count)
+
+df$identity = factor(df$identity, levels = names(tapply(scRNA$Epilepsy1- scRNA$Epilepsy_neg1, scRNA$identity, mean)[order(tapply(scRNA$Epilepsy1- scRNA$Epilepsy_neg1, scRNA$identity, mean),decreasing = F)]))
+
+x = NULL
+m = 0
+for(el in levels(df$identity)){
+  if(m==0){
+    x[el] = 0
+    m = m + 0.5*unique(df[df$identity == el,"identity.count"])
+  } else {
+    x[el] = m + 0.5*unique(df[df$identity == el,"identity.count"])
+    m = m + unique(df[df$identity == el,"identity.count"])
+  }
+}
+
+df$x = x[df$identity]
+
+
+X = data.frame(cell1 = levels(df$identity)[1:(length(levels(df$identity))-1)], cell2 = levels(df$identity)[2:(length(levels(df$identity)))])
+
+X$p = sapply(1:(length(levels(df$identity))-1), function(el){
+  wilcox.test(Epilepsy1 ~ identity , data = scRNA[[]][scRNA$identity %in% c(X[el,"cell1"], X[el,"cell2"]),])$p.value
+})
+
+X$padj = p.adjust(X$p, method = "BH")
+
+X$label =  label = ifelse(X$padj<0.0001, "***", ifelse(X$padj<0.001, "**", ifelse(X$padj<0.05, "*", ifelse(X$padj<0.1, ".", "ns"))))
+
+X$Xmin = df[match(X$cell1, df$identity), "x"] +500
+X$Xmax = df[match(X$cell2, df$identity), "x"] -500
+
+X$Xmean = (X$Xmin + X$Xmax) /2
+
+p = ggplot() +
+  geom_bar(stat = "identity", data = df, aes(x = x, y = prop, fill = QE, width = identity.count-500), position = "stack") +
+  geom_point(data = data.frame(x = mean(df$x), y = 110), color = "white", aes(x=x, y=y))+
+  geom_segment(aes(x = Xmin, y = 103, xend = Xmax, yend = 103), data = X) +
+  geom_text(aes(x = Xmean, y = 106, label = label), data = X) +
+  coord_flip() +
+  scale_x_continuous(breaks=x,labels=names(x), name = "Cell type") +  scale_y_continuous(breaks=20*(0:5), name = "Percent of cells", expand = c(0,0)) + theme_classic() + scale_fill_manual(name = "Quintiles of\nGAE signature:", values = rev(hcl.colors("Blue-Red", n=5)), breaks = paste0("Q", 1:5), labels = c("Q1 (highest)", paste0("Q", 2:4), "Q5 (lowest)")) + ggtitle("GAE gene signature expression in different cell types")
+
+
+Fig3_pop_epi = p
+
+Fig3_pop_epi
+
+
+```
+
+
+```{r}
+scRNA$identity = scRNA$Verhaak_id
+
+library(tidyverse)
+library(tidyverse)
+library(ggplot2)
+
+x = quantile(scRNA$GAE, seq(0,1,0.2))
+x = sapply(scRNA$GAE, function(el){
+  sum(x > el)
+})
+x[x==0] = 1
+
+scRNA$QE = paste0("Q", x)
+
+df <- scRNA[[]] %>%
+  group_by(identity, QE) %>%
+  summarise(count = n()) %>%
+  mutate(identity.count = sum(count),
+         prop = 100*count/sum(count)) %>%
+  ungroup()
+
+df = as.data.frame(as.matrix(df))
+
+for(el in c("count", "identity.count", "prop")){
+  df[,el] = as.numeric(as.character(df[,el]))
+}
+
+df$identity.count = df$identity.count + 0.2*max(df$identity.count)
+
+df$identity = factor(df$identity, levels = names(tapply(scRNA$Epilepsy1- scRNA$Epilepsy_neg1, scRNA$identity, mean)[order(tapply(scRNA$Epilepsy1- scRNA$Epilepsy_neg1, scRNA$identity, mean),decreasing = F)]))
+
+x = NULL
+m = 0
+for(el in levels(df$identity)){
+  if(m==0){
+    x[el] = 0
+    m = m + 0.5*unique(df[df$identity == el,"identity.count"])
+  } else {
+    x[el] = m + 0.5*unique(df[df$identity == el,"identity.count"])
+    m = m + unique(df[df$identity == el,"identity.count"])
+  }
+}
+
+df$x = x[df$identity]
+
+
+X = data.frame(cell1 = levels(df$identity)[1:(length(levels(df$identity))-1)], cell2 = levels(df$identity)[2:(length(levels(df$identity)))])
+
+X$p = sapply(1:(length(levels(df$identity))-1), function(el){
+  wilcox.test(Epilepsy1 ~ identity , data = scRNA[[]][scRNA$identity %in% c(X[el,"cell1"], X[el,"cell2"]),])$p.value
+})
+
+X$padj = p.adjust(X$p, method = "BH")
+
+X$label =  label = ifelse(X$padj<0.0001, "***", ifelse(X$padj<0.001, "**", ifelse(X$padj<0.05, "*", ifelse(X$padj<0.1, ".", "ns"))))
+
+X$Xmin = df[match(X$cell1, df$identity), "x"] +500
+X$Xmax = df[match(X$cell2, df$identity), "x"] -500
+
+X$Xmean = (X$Xmin + X$Xmax) /2
+
+p = ggplot() +
+  geom_bar(stat = "identity", data = df, aes(x = x, y = prop, fill = QE, width = identity.count-500), position = "stack") +
+  geom_point(data = data.frame(x = mean(df$x), y = 110), color = "white", aes(x=x, y=y))+
+  geom_segment(aes(x = Xmin, y = 103, xend = Xmax, yend = 103), data = X) +
+  geom_text(aes(x = Xmean, y = 106, label = label), data = X) +
+  coord_flip() +
+  scale_x_continuous(breaks=x,labels=names(x), name = "Cell type") +  scale_y_continuous(breaks=20*(0:5), name = "Percent of cells", expand = c(0,0)) + theme_classic() + scale_fill_manual(name = "Quintiles of\nGAE signature:", values = rev(hcl.colors("Blue-Red", n=5)), breaks = paste0("Q", 1:5), labels = c("Q1 (highest)", paste0("Q", 2:4), "Q5 (lowest)")) + ggtitle("GAE gene signature expression in different cell types")
+
+
+Fig3_pop_epi = p
+
+Fig3_pop_epi
+
+
+```
+
+```{r}
+setwd(paste0(wd, "/dt"))
+save(scRNA, file = "bisque_input.Rdata")
+```
+
+
+```{r}
+setwd(paste0(wd, "/Figures"))
+ggsave(Fig3_pop_epi, filename = "Fig3_pop_epi.png", width = 7, height = 5, dpi = 400)
+
+save(Fig3_pop_epi, file = "Fig3_pop_epi.Rdata")
+```
+
+
+```{r}
+#AEDs
+```
+
+```{r}
+rm(list = "glioma")
+setwd(paste0(wd, "/dt"))
+load(file = "bisque_input.Rdata")
+load("myaeds.Rdata")
+```
+
+```{r}
+my_aeds
+```
+
+
+```{r}
+length(drh)
+drh = drh[!sapply(sapply(drh, function(el){intersect(el, rownames(scRNA))}), length)==0]
+drh = drh[my_aeds]
+length(drh)
+```
+
+
+```{r}
+for(el in names(drh)){
+  scRNA = AddModuleScore(scRNA, features = drh[el], name = gsub(" ", "_", paste0("DRH_", el)), assay = "SCT")
+}
+```
+
+
+```{r}
+scRNA[[]][,grepl("DRH", colnames(scRNA[[]]))]
+```
+
+```{r}
+x = data.frame(name = colnames(scRNA[[]])[grepl("DRH", colnames(scRNA[[]]))], p_KW = sapply(colnames(scRNA[[]])[grepl("DRH", colnames(scRNA[[]]))], function(el){
+  kruskal.test(as.formula(paste0(el, "~identity")), data = scRNA[[]])$p.value
+}))
+
+x
+```
+
+
+
+
+```{r}
+x = scRNA[[]]
+
+
+df = data.frame(feature = rep(unique(scRNA$identity)[!unique(scRNA$identity) == "none"], length(my_aeds)),
+   aeds = unlist(lapply(gsub(" ", "_", my_aeds), rep, times = length(unique(scRNA$identity)[!unique(scRNA$identity) == "none"]))))
+
+for(el in dim(df)[2]){
+  
+}
+rownames(df) = paste(df$feature, df$aeds, sep = "_")
+
+x = sapply(1:(dim(df)[1]), function(el){
+  x$cell_type = ifelse(x$identity == df[el,1], "yes", "no")
+  y = c(
+    p = wilcox.test(as.formula(paste0("DRH_", df[el,2], "1 ~ cell_type")), data = x)$p.value,
+    logfc = log2((mean(x[x$cell_type == "yes",paste0("DRH_", df[el,2], "1")] - min(x[,paste0("DRH_", df[el,2], "1")])))/(mean(x[x$cell_type == "no",paste0("DRH_", df[el,2], "1")] - min(x[,paste0("DRH_", df[el,2], "1")]))))
+  )
+  return(y)
+})
+
+colnames(x) = rownames(df)
+
+
+df = cbind(df, as.data.frame(flip(x))[rownames(df),])
+
+x = scRNA[[]]
+
+df2 = data.frame(feature = "idh", aeds = gsub(" ", "_", my_aeds))
+rownames(df2) = paste(df2$feature, df2$aeds, sep = "_")
+
+x = sapply(1:(dim(df2)[1]), function(el){
+  x$cell_type = ifelse(x$IDH == "mut", "yes", "no")
+  y = c(
+    p = wilcox.test(as.formula(paste0("DRH_", df2[el,2], "1 ~ cell_type")), data = x)$p.value,
+    logfc = log2((mean(x[x$cell_type == "yes",paste0("DRH_", df2[el,2], "1")] - min(x[,paste0("DRH_", df2[el,2], "1")])))/(mean(x[x$cell_type == "no",paste0("DRH_", df2[el,2], "1")] - min(x[,paste0("DRH_", df2[el,2], "1")]))))
+  )
+  return(y)
+})
+
+colnames(x) = rownames(df2)
+
+df2 = cbind(df2, as.data.frame(flip(x))[rownames(df2),])
+
+df = rbind(df, df2)
+
+x = scRNA[[]]
+
+df2 = data.frame(feature = "codel", aeds = gsub(" ", "_", my_aeds))
+rownames(df2) = paste(df2$feature, df2$aeds, sep = "_")
+
+x = sapply(1:(dim(df2)[1]), function(el){
+  x$cell_type = ifelse(x$experiment %in% "GSE70630", "yes", "no")
+  y = c(
+    p = wilcox.test(as.formula(paste0("DRH_", df2[el,2], "1 ~ cell_type")), data = x)$p.value,
+    logfc = log2((mean(x[x$cell_type == "yes",paste0("DRH_", df2[el,2], "1")] - min(x[,paste0("DRH_", df2[el,2], "1")])))/(mean(x[x$cell_type == "no",paste0("DRH_", df2[el,2], "1")] - min(x[,paste0("DRH_", df2[el,2], "1")]))))
+  )
+  return(y)
+})
+
+colnames(x) = rownames(df2)
+
+df2 = cbind(df2, as.data.frame(flip(x))[rownames(df2),])
+
+df = rbind(df, df2)
+```
+
+```{r}
+df
+```
+```{r}
+df$padj = p.adjust(df$p, method = "BH")
+df$padj = -log10(df$padj + 1e-200)
+
+f = function(x){
+  (x - min(x))/(max(x) - min(x))
+}
+
+df$feature = factor(df$feature, levels = rev(c("codel", "idh", "neural", "proneural", "classical", "mesenchymal", "oligodendroglia", "immune")))
+
+df$aeds = factor(df$aeds, levels = gsub(" ", "_", my_aeds))
+
+p = ggplot(data = df, mapping = aes(x = aeds, y = feature, color = logfc, size = sapply(padj, function(el){min(el,4)}))) +
+  geom_point() + 
+  scale_x_discrete(name="Pharmaceutical", breaks = gsub(" ", "_", my_aeds), labels = my_aeds) +
+  scale_y_discrete(name="Cell population", breaks = rev(c("codel", "idh", "neural", "proneural", "classical", "mesenchymal", "oligodendroglia", "immune")), labels = rev(c("1p19q-codeleted", "IDH-mutated", "GS: neural", "GS: proneural", "GS: classical", "GS: mesenchymal", "oligodendroglia", "immune"))) +
+  scale_size(name =  "adjusted p-value", breaks = c(0, 1, 2, 3, 4), labels = c(1, 0.1, 0.01, 0.001, "\u2264 0.0001"), range = c(3,7), limits = c(1,4)) + 
+  scale_color_gradientn(name = "logFC", colors = c("blue4", "blue", "cornflowerblue", "cyan", "gray80", "yellow", "orange", "red", "red4"), values = f(c(quantile(df$logfc[df$logfc<0], probs = seq(0, 1, 1/3))[1:3], 0, quantile(df$logfc[df$logfc>0], probs = seq(0, 1, 1/3))[2:4]))) +
+  labs(title = "Single cell AEDs signatures", subtitle = "Wilcoxon test on signature expression level in given populations") +
+  theme_classic() +
+  theme(legend.position = c("right"), axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+```
+
+```{r}
+fig4_scrna_drh <- p
+
+setwd(paste0(wd, "/Figures"))
+save(fig4_scrna_drh, file = "fig4_scrna_drh.Rdata")
+
+setwd(paste0(wd, "/Figures"))
+ggsave(fig4_scrna_drh, filename = "fig4_scrna_drh.png", width = 10, height = 6, dpi = 400)
+```
+
+
+
+
+```{r}
+my_aeds = intersect(my_aeds, names(dsigdb))
+```
+
+
+```{r}
+length(dsigdb)
+dsigdb = dsigdb[!sapply(sapply(dsigdb, function(el){intersect(el, rownames(scRNA))}), length)==0]
+dsigdb = dsigdb[my_aeds]
+length(dsigdb)
+```
+
+
+```{r}
+for(el in names(dsigdb)){
+  scRNA = AddModuleScore(scRNA, features = dsigdb[el], name = gsub(" ", "_", paste0("dsigdb_", el)), assay = "SCT")
+}
+```
+
+
+```{r}
+scRNA[[]][,grepl("dsigdb", colnames(scRNA[[]]))]
+```
+
+```{r}
+x = data.frame(name = colnames(scRNA[[]])[grepl("dsigdb", colnames(scRNA[[]]))], p_KW = sapply(colnames(scRNA[[]])[grepl("dsigdb", colnames(scRNA[[]]))], function(el){
+  kruskal.test(as.formula(paste0(el, "~identity")), data = scRNA[[]])$p.value
+}))
+
+x
+```
+
+
+
+
+```{r}
+x = scRNA[[]]
+
+
+df = data.frame(feature = rep(unique(scRNA$identity)[!unique(scRNA$identity) == "none"], length(my_aeds)),
+   aeds = unlist(lapply(gsub(" ", "_", my_aeds), rep, times = length(unique(scRNA$identity)[!unique(scRNA$identity) == "none"]))))
+
+for(el in dim(df)[2]){
+  
+}
+rownames(df) = paste(df$feature, df$aeds, sep = "_")
+
+x = sapply(1:(dim(df)[1]), function(el){
+  x$cell_type = ifelse(x$identity == df[el,1], "yes", "no")
+  y = c(
+    p = wilcox.test(as.formula(paste0("dsigdb_", df[el,2], "1 ~ cell_type")), data = x)$p.value,
+    logfc = log2((mean(x[x$cell_type == "yes",paste0("dsigdb_", df[el,2], "1")] - min(x[,paste0("dsigdb_", df[el,2], "1")])))/(mean(x[x$cell_type == "no",paste0("dsigdb_", df[el,2], "1")] - min(x[,paste0("dsigdb_", df[el,2], "1")]))))
+  )
+  return(y)
+})
+
+colnames(x) = rownames(df)
+
+
+df = cbind(df, as.data.frame(flip(x))[rownames(df),])
+
+x = scRNA[[]]
+
+df2 = data.frame(feature = "idh", aeds = gsub(" ", "_", my_aeds))
+rownames(df2) = paste(df2$feature, df2$aeds, sep = "_")
+
+x = sapply(1:(dim(df2)[1]), function(el){
+  x$cell_type = ifelse(x$IDH == "mut", "yes", "no")
+  y = c(
+    p = wilcox.test(as.formula(paste0("dsigdb_", df2[el,2], "1 ~ cell_type")), data = x)$p.value,
+    logfc = log2((mean(x[x$cell_type == "yes",paste0("dsigdb_", df2[el,2], "1")] - min(x[,paste0("dsigdb_", df2[el,2], "1")])))/(mean(x[x$cell_type == "no",paste0("dsigdb_", df2[el,2], "1")] - min(x[,paste0("dsigdb_", df2[el,2], "1")]))))
+  )
+  return(y)
+})
+
+colnames(x) = rownames(df2)
+
+df2 = cbind(df2, as.data.frame(flip(x))[rownames(df2),])
+
+df = rbind(df, df2)
+
+x = scRNA[[]]
+
+df2 = data.frame(feature = "codel", aeds = gsub(" ", "_", my_aeds))
+rownames(df2) = paste(df2$feature, df2$aeds, sep = "_")
+
+x = sapply(1:(dim(df2)[1]), function(el){
+  x$cell_type = ifelse(x$experiment %in% "GSE70630", "yes", "no")
+  y = c(
+    p = wilcox.test(as.formula(paste0("dsigdb_", df2[el,2], "1 ~ cell_type")), data = x)$p.value,
+    logfc = log2((mean(x[x$cell_type == "yes",paste0("dsigdb_", df2[el,2], "1")] - min(x[,paste0("dsigdb_", df2[el,2], "1")])))/(mean(x[x$cell_type == "no",paste0("dsigdb_", df2[el,2], "1")] - min(x[,paste0("dsigdb_", df2[el,2], "1")]))))
+  )
+  return(y)
+})
+
+colnames(x) = rownames(df2)
+
+df2 = cbind(df2, as.data.frame(flip(x))[rownames(df2),])
+
+df = rbind(df, df2)
+```
+
+```{r}
+df
+```
+```{r}
+df$padj = p.adjust(df$p, method = "BH")
+df$padj = -log10(df$padj + 1e-200)
+
+f = function(x){
+  (x - min(x))/(max(x) - min(x))
+}
+
+df$feature = factor(df$feature, levels = rev(c("codel", "idh", "neural", "proneural", "classical", "mesenchymal", "oligodendroglia", "immune")))
+
+df$aeds = factor(df$aeds, levels = gsub(" ", "_", my_aeds))
+
+p = ggplot(data = df, mapping = aes(x = aeds, y = feature, color = logfc, size = sapply(padj, function(el){min(el,4)}))) +
+  geom_point() + 
+  scale_x_discrete(name="Pharmaceutical", breaks = gsub(" ", "_", my_aeds), labels = my_aeds) +
+  scale_y_discrete(name="Cell population", breaks = rev(c("codel", "idh", "neural", "proneural", "classical", "mesenchymal", "oligodendroglia", "immune")), labels = rev(c("1p19q-codeleted", "IDH-mutated", "GS: neural", "GS: proneural", "GS: classical", "GS: mesenchymal", "oligodendroglia", "immune"))) +
+  scale_size(name =  "adjusted p-value", breaks = c(0, 1, 2, 3, 4), labels = c(1, 0.1, 0.01, 0.001, "\u2264 0.0001"), range = c(3,7), limits = c(1,4)) + 
+  scale_color_gradientn(name = "logFC", colors = c("blue4", "blue", "cornflowerblue", "cyan", "gray80", "yellow", "orange", "red", "red4"), values = f(c(quantile(df$logfc[df$logfc<0], probs = seq(0, 1, 1/3))[1:3], 0, quantile(df$logfc[df$logfc>0], probs = seq(0, 1, 1/3))[2:4]))) +
+  labs(title = "Single cell AEDs signatures", subtitle = "Wilcoxon test on signature expression level in given populations") +
+  theme_classic() +
+  theme(legend.position = c("right"), axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+```
+
+```{r}
+fig4_scrna_dsigdb <- p
+
+setwd(paste0(wd, "/Figures"))
+save(fig4_scrna_dsigdb, file = "fig4_scrna_dsigdb.Rdata")
+
+setwd(paste0(wd, "/Figures"))
+ggsave(fig4_scrna_dsigdb, filename = "fig4_scrna_dsigdb.png", width = 10, height = 6, dpi = 400)
+```
+
+```{r}
+#LAST_Figure
+x = c(,,,)
+```
+
+
+
+```{r}
+dim = 200
+
+#glioma = RunPCA(glioma, npcs = dim, features = VariableFeatures(glioma)) 
+
+x = pcaMarchenkoPastur(M = length(VariableFeatures(glioma)), N = dim(glioma)[2], pca.sdev = glioma@reductions$pca@stdev, factor = 1)
+dims = (1:dim)[x]
+
+range(dims)
+
+glioma <- RunUMAP(glioma, dims = dims, reduction = "pca")
+
+glioma = RunUMAP(glioma, reduction.name = "UMAP3d", n.components = 3, dims = 1:30)
+```
+
+
+
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+df = glioma[[]]
+for(el in c("Epilepsy1", "NRSF1", "Epilepsy_neg1")){
+  #df[,el] = ifelse(df$prim_ident == el, 1, 0)
+  p = clustree(df, prefix = "integrated_snn_res.", node_colour = el, node_colour_aggr = "mean") + scale_color_gradientn(colors = rev(hcl.colors(9, "heat"))) + ggtitle(el)
+  ggsave(p, filename = paste0("Clustree_glioma_", el, ".png"), width = 10, height = 8, dpi = 400)
+}
+```
+
+```{r}
+library(babyplots)
+
+x = glioma@reductions$UMAP3d@cell.embeddings
+colnames(x) = c("x", "y", "z")
+p = pointCloud(coords = x, colorBy = "categories", colorVar =  glioma$Suva, turntable = T, showUI = T,  size = 1.5)
+
+p
+```
+
+```{r}
+x = glioma@reductions$UMAP3d@cell.embeddings
+colnames(x) = c("x", "y", "z")
+p = pointCloud(coords = x, colorBy = "values", colorVar =  glioma$GAE,colorScale = "PiYG", turntable = T, showUI = T,  size = 3)
+
+p
+```
+
+```{r}
+x = glioma@reductions$UMAP3d@cell.embeddings
+colnames(x) = c("x", "y", "z")
+p = pointCloud(coords = x, colorBy = "values", colorVar =  glioma$NRSF1 ,colorScale = "PiYG", turntable = T, showUI = T,  size = 3)
+
+p
+```
+
+
+
+```{r}
+library(dyno)
+library(tidyverse)
+```
+
+```{r}
+dynwrap::test_docker_installation(detailed = TRUE)
+```
+
+
+
+
+```{r}
+dataset <- wrap_expression(
+  counts = flip(glioma@assays$RNA@counts[rownames(glioma@assays$integrated@scale.data),]),
+  expression = flip(glioma@assays$integrated@scale.data)
+)
+```
+
+
+
+```{r}
+#dp = add_prior_information(dataset, start_id = rownames(GBM[[]][GBM$integrated_snn_res.1 == "1" & GBM$stemness > quantile(GBM$stemness, seq(0,1,0.1))["90%"],]))
+model.slingshot <- infer_trajectory(dataset, "slingshot")
+setwd(paste0(wd, "/scRNA_res"))
+save(model.slingshot, file = "model.slingshot.Rdata")
+
+#model.mst = simplify_trajectory(model.mst)
+```
+
+```{r}
+glioma$pseudotime = calculate_pseudotime(model.slingshot)
+```
+
+```{r}
+cor.test(glioma$pseudotime, glioma$GAE)
+```
+
+
+```{r}
+x = glioma@reductions$UMAP3d@cell.embeddings
+colnames(x) = c("x", "y", "z")
+p = pointCloud(coords = x, colorBy = "values", colorVar =  glioma$pseudotime ,colorScale = "RdYlBu", turntable = T, showUI = T,  size = 3)
+
+p
+```
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+
+p = plot_dimred(model.slingshot, expression_source = dataset$expression, dimred = glioma@reductions$umap@cell.embeddings)
+p = p + labs(title = "slingshot")
+p = ggplot_build(p)
+p$data[[1]]$colour = "white"
+p$data[[2]]$alpha = 0.5
+#p
+p=ggplot_gtable(p)
+
+ggsave(plot = p, filename = "slingshot.png")
+```
+
+
+
+```{r}
+#dp = add_prior_information(dataset, start_id = rownames(GBM[[]][GBM$integrated_snn_res.1 == "1" & GBM$stemness > quantile(GBM$stemness, seq(0,1,0.1))["90%"],]))
+model.mst <- infer_trajectory(dataset, "mst")
+setwd(paste0(wd, "/scRNA_res"))
+save(model.mst, file = "model.mst.Rdata")
+
+model.mst = simplify_trajectory(model.mst)
+```
+
+```{r}
+glioma$pseudotime = calculate_pseudotime(model.mst)
+```
+
+```{r}
+cor.test(glioma$pseudotime, glioma$GAE)
+```
+
+
+```{r}
+x = glioma@reductions$UMAP3d@cell.embeddings
+colnames(x) = c("x", "y", "z")
+p = pointCloud(coords = x, colorBy = "values", colorVar =  glioma$pseudotime ,colorScale = "RdYlBu", turntable = T, showUI = T,  size = 3)
+
+p
+```
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+
+p = plot_dimred(model.mst, expression_source = dataset$expression, dimred = glioma@reductions$umap@cell.embeddings)
+p = p + labs(title = "mst")
+p = ggplot_build(p)
+p$data[[1]]$colour = "white"
+p$data[[2]]$alpha = 0.5
+#p
+p=ggplot_gtable(p)
+
+ggsave(plot = p, filename = "mst.png")
+```
+
+
+
+```{r}
+x = c(,,,)
+'scRNA$age_group = ifelse(is.na(scRNA$age), NA, ifelse(scRNA$age>46, ">46", "<46"))
+df = data.frame(feat = c("histology", "gender", "IDH", "recurrent", "grade", "age_group"),
+                name = c("Histological type", "Gender", "IDH status", "Recurrent tumor", "WHO grade", "Age group"))
+                df2 =  list(histology = setNames(c("yellow", "blue", "red4"), c("oligodendroglioma", "astrocytoma", "GBM")),
+                           gender = setNames(c("red", "blue"), c("female", "male")),
+                          # IDH = setNames(c("cyan", "darkgoldenrod"), c("wt", "mut")),
+                           recurrent = setNames(c("orange", "purple"), c("no", "yes")),
+                           grade = setNames(c("darkseagreen1", "pink", "red4"), c("2", "3", "4")),
+                           age_group = setNames(c("gray80", "black"), c("<46", ">46")))
+
+pl = list()
+
+
+
+Idents(scRNA) = factor(scRNA$identity, levels = c("glioma", "astrocyte", "immune", "oligodendroglia", "neuron",  "vascular"))
+
+for(el in names(df2)){
+  p = DimPlot(scRNA, reduction = "umap", label = T)
+  x = as.data.frame(ggplot_build(p)$data[[2]])
+for(EL in dropNA(as.character(dropNA(unique(scRNA[[]][,el]))))){
+   x[,EL] = 0
+   for(X in dropNA(as.character(unique(x[,"label"])))){
+     x[x$label==X,EL] = sum(scRNA[[]][,el] == EL & scRNA[[]]$identity == X , na.rm = T) 
+   }
+  }
+ x$r = sum(c(abs(range(as.data.frame(ggplot_build(p)$data[[1]])$x)), abs(range(as.data.frame(ggplot_build(p)$data[[2]])$y))))/32
+ x$r = x$r * (sapply(x$label, function(X){
+  sum(scRNA$identity == as.character(X))
+})/max(sapply(x$label, function(X){
+  sum(scRNA$identity == as.character(X))
+}))+1)
+  p = DimPlot(scRNA, reduction = "umap", label = F, cols = "Set3", pt.size = 0.5) + scale_color_manual("Identity", values = alpha(c("slategray", "royalblue", "purple", "salmon4", "olivedrab", "red"),0.5))
+  p = p + geom_scatterpie(aes(x=x, y=y, r = r), data=x, cols = dropNA(as.character(dropNA(unique(scRNA[[]][,el])))), color=NA)
+  
+  p = p + coord_fixed()
+  
+  p = p + scale_fill_manual(name = df[match(el, df$feat),"name"],
+                          breaks =as.character(dropNA(unique(scRNA[[]][,el]))),
+                          labels = gsub("oligodendroglioma", "OG", gsub("astrocytoma", "AS",  paste0(as.character(dropNA(unique(scRNA[[]][,el]))), " [", sapply(as.character(dropNA(unique(scRNA[[]][,el]))), function(X){sum(dropNA(scRNA[[]]==X))}), "]"))),
+                          values = df2[[el]][as.character(dropNA(unique(scRNA[[]][,el])))])
+
+p = p +
+  theme(axis.title = element_blank(), axis.text = element_blank(), axis.ticks = element_blank(), axis.line = element_blank(),  legend.position = "bottom",  legend.direction = "horizontal") + guides(color = F)
+
+pl[[el]] = p
+}
+library(ggpubr)
+
+setwd(paste0(wd, "/scRNA_res"))
+Fig3_bigorigins = pl
+ggsave(filename = "Fig3s_bigorigins.png", width = 18, height = 14, plot = ggarrange(plotlist = pl, nrow = 2, ncol = 3))'
+```
+
+
+```{r}
+'m = lapply(c("astrocyte", "immune", "oligodendroglia"), function(X){
+  FindMarkers(scRNA, group.by = "identity", ident.1 = X, ident.2 = "glioma", only.pos = T)
+})
+m'
+```
+
+```{r}
+'fig3a = lapply(c("PTPRC", "PECAM1", "CLU",  "PLP1", "SCG2"), gexp, scRNA = scRNA, reduction = "tSNE")
+fig3a = lapply(fig3a, function(X){
+  X = X + theme(axis.title.x = element_blank(), axis.title.y = element_blank(), axis.text = element_blank(), axis.ticks = element_blank(), axis.line = element_blank(), legend.position = "none") +
+  coord_fixed()
+})'
+```
+
+
+
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+save(scRNA, file = "scRNA_SCT_RPCA_identified.Rdata")
+#load(file = "scRNA_SCT_RPCA_identified.Rdata")
+```
+
+
+
+```{r}
+ViolPlot(scRNA, features = "GAE")
+```
+
+
+```{r}
+x = c(,,,)
+#AEDs
+```
+
+
+```{r}
+x$targets = sapply(rownames(x), function(el){
+  X = dunnTest(as.formula(paste0(el, "~identity")), data = scRNA[[]], method = "bh")
+  X = cldList(P.adj ~ Comparison,data = X$res,threshold = 0.05)
+  X = X[grepl(X[X$Group == x[el,"max"],"Letter"], X$Letter),"Group"]
+  X = paste(X, collapse = "_")
+  return(X)
+})
+
+```
+```{r}
+x$p_IDH = sapply(rownames(x), function(el){
+  kruskal.test(as.formula(paste0(el, "~IDH")), data = scRNA[[]])$p.value
+})
+
+x$padj_IDH = p.adjust(x$p_IDH, method = "BH")
+
+x$IDH = sapply(rownames(x), function(el){
+  x = tapply(scRNA[[]][,el], scRNA$IDH, mean)
+  x = names(x)[x == max(x)]
+  return(x)
+})
+
+x$IDH[x$padj_IDH>0.05] = "ns"
+```
+
+
+
+
+
+```{r}
+x = cbind(x, as.data.frame(flip(sapply(rownames(x), function(el){
+  unlist(cor.test(scRNA[[]][!scRNA$identity %in% c("immune", "vascular"),el], scRNA[[]][!scRNA$identity %in% c("immune", "vascular"),"Epilepsy1"])[c("p.value", "estimate")])
+}))))
+x$padjcor = p.adjust(x$p.value, method = "BH")
+
+x
+```
+
+```{r}
+drh_res= x
+drh_res$pharmaceutical  = gsub("DRH_", "", gsub("1", "", drh_res$name))
+```
+
+
+```{r}
+drh_res[(!drh_res$IDH=="ns"),]
+```
+
+
+```{r}
+x = drh_res[(!drh_res$IDH=="ns")|(drh_res$targets %in% c("oligodendroglia"))|(drh_res$pharmaceutical %in% c("gabapentin", "pregabalin")),]
+x = x[!x$pharmaceutical %in% c("levetiracetam", "brivaracetam", "lorazepam", "clonazepam"),]
+x
+```
+
+```{r}
+p = matrix(0, nrow = length(c(unique(scRNA$identity), "IDHmut", "IDHwt")), ncol = length(x$pharmaceutical), dimnames = list(r = c(unique(scRNA$identity), "IDHmut", "IDHwt"), c = x$pharmaceutical))
+
+for(el in colnames(p)){
+  p[unlist(strsplit(drh_res[drh_res$pharmaceutical == el,"targets"], "_")),el] = 1
+}
+p["IDHmut",x[x$IDH == "mut","pharmaceutical"]] = 1
+p["IDHwt",x[x$IDH == "wt","pharmaceutical"]] = 1
+
+p
+```
+```{r}
+library(igraph)
+```
+
+
+
+```{r}
+df = NULL
+X = NULL
+for(el in unique(scRNA$identity)){
+  df = c(df, x[grepl(el, x$targets),"pharmaceutical"])
+  X = c(X, rep(el, times = length(x[grepl(el, x$targets),"pharmaceutical"])))
+}
+df = data.frame(feature = X, pharmaceutical = df)
+el = x[x$IDH == "mut", c("IDH", "pharmaceutical")]
+colnames(el) = c("feature", "pharmaceutical")
+df = rbind(df, el)
+
+el = x[x$IDH == "wt", c("IDH", "pharmaceutical")]
+colnames(el) = c("feature", "pharmaceutical")
+df = rbind(df, el)
+
+df$feature = gsub("glioma", "glioma cell", gsub("immune", "immune\ncell", gsub("mut", "IDHmut", gsub("wt", "IDHwt", df$feature))))
+
+df
+```
+
+
+
+
+
+
+
+```{r}
+library(ggraph)
+```
+
+```{r}
+set.seed(1995)
+
+lapply(c('stress', 'fr', 'lgl', 'graphopt'), function(layout) {
+  ggraph(df, layout = layout) + 
+    geom_edge_link() +
+    geom_node_label(aes(label = name)) 
+})
+```
+
+```{r}
+f2 = function(x){
+  x[x %in% drh_res$pharmaceutical] = "pharmaceutical"
+  return(x)
+}
+
+library(ggraph)
+library(tidygraph)
+df <- as_tbl_graph(df)
+p = ggraph(df, layout = "stress") + 
+  geom_point(data = data.frame(x = c(-4,-4, 4, 4), y = c(-1, 1, -1, 1)), aes(x=x,y=y), color = "white") +
+  geom_edge_link() +
+  geom_node_label(aes(label = name, fill = f2(name))) +
+  scale_fill_manual(values = alpha(c("seashell4", "darkturquoise", "darkgreen", "darkgoldenrod1", "tomato", "darkorchid4", "white", "cyan", "darkgoldenrod"),1), breaks = c("glioma cell", "astrocyte", "oligodendroglia", "neuron", "vascular", "immune\ncell", "pharmaceutical", "IDHwt", "IDHmut")) +
+  theme_classic() + theme(legend.position = "none", axis.ticks.x = element_blank(), axis.text.x = element_blank(), axis.line.x = element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank(), axis.line.y = element_blank()) + labs(title = "Significant associations of single cell pharmaceutical signatures", x = "", y = "")
+
+ggsave(p, width = 8, height = 6, filename = "t1.png")
+```
+
+```{r}
+
+```
+
+
+```{r}
+fig4sca_drh = p
+setwd(paste0(wd, "/Figures"))
+ggsave(fig4sca_drh, filename = "fig4sca_drh.png", width = 8, height = 6, dpi = 400)
+
+save(fig4sca_drh, f2, drh_res, file = "fig4sca_drh.Rdata")
+```
+```{r}
+f = function(x){
+  x = (x-min(x))/(max(x) - min(x))
+}
+
+
+df = data.frame(UMAP1 = scRNA@reductions$umap@cell.embeddings[,"UMAP_1"],
+                UMAP2 = scRNA@reductions$umap@cell.embeddings[,"UMAP_2"])
+
+p = list()
+
+for(el in c("Perampanel", "Gabapentin", "Clobazam", "Acetazolamide")){
+  df[,tolower(el)] = scRNA[[]][,paste0("DRH_", tolower(el), "1")]
+  
+  p[[el]] = ggplot(data = df, aes_string(x = "UMAP1", y = "UMAP2", color = tolower(el))) + geom_point()  + scale_color_gradientn(name = "Seurat signature score", colors = alpha(c("blue4", "dodgerblue", "cyan",  "gray70", "yellow", "red", "magenta4"),0.5), values = f(quantile(df[,tolower(el)], seq(0, 1, 1/7)))) +
+    theme_classic() + theme(axis.ticks.x = element_blank(), plot.title = element_text(hjust = 0.5), axis.text.x = element_blank(), axis.line.x = element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank(), axis.line.y = element_blank()) + labs(title = el, x = "", y = "")
+}
+
+```
+
+
+```{r}
+fig4scp_drh = p
+setwd(paste0(wd, "/Figures"))
+ggsave(ggarrange(plotlist = p, nrow = 2, ncol = 2, common.legend = T, legend = "bottom"), filename = "fig4scp_drh.png", width = 8, height = 6, dpi = 400)
+
+save(fig4scp_drh, f, file = "fig4scp_drh.Rdata")
+```
+
+```{r}
+dsigdb = dsigdb[!sapply(sapply(dsigdb, function(el){intersect(el, rownames(scRNA))}), length)==0]
+```
+
+
+```{r}
+for(el in names(dsigdb)){
+  scRNA = AddModuleScore(scRNA, features = dsigdb[el], name = gsub(" ", "_", paste0("DSIGDP_", el)), assay = "integrated")
+}
+```
+
+
+
+
+```{r}
+x = data.frame(name = colnames(scRNA[[]])[grepl("DSIGDP", colnames(scRNA[[]]))], p_KW = sapply(colnames(scRNA[[]])[grepl("DSIGDP", colnames(scRNA[[]]))], function(el){
+  kruskal.test(as.formula(paste0(el, "~identity")), data = scRNA[[]])$p.value
+}))
+
+x
+```
+
+```{r}
+x$max = sapply(rownames(x), function(el){
+  x = tapply(scRNA[[]][,el], scRNA$identity, mean)
+  x = names(x)[x == max(x)]
+  return(x)
+})
+```
+
+
+
+```{r}
+x$targets = sapply(rownames(x), function(el){
+  X = dunnTest(as.formula(paste0(el, "~identity")), data = scRNA[[]], method = "bh")
+  X = cldList(P.adj ~ Comparison,data = X$res,threshold = 0.05)
+  X = X[grepl(X[X$Group == x[el,"max"],"Letter"], X$Letter),"Group"]
+  X = paste(X, collapse = "_")
+  return(X)
+})
+
+x
+```
+```{r}
+x$p_IDH = sapply(rownames(x), function(el){
+  kruskal.test(as.formula(paste0(el, "~IDH")), data = scRNA[[]])$p.value
+})
+
+x$padj_IDH = p.adjust(x$p_IDH, method = "BH")
+
+x$IDH = sapply(rownames(x), function(el){
+  x = tapply(scRNA[[]][,el], scRNA$IDH, mean)
+  x = names(x)[x == max(x)]
+  return(x)
+})
+
+x$IDH[x$padj_IDH>0.05] = "ns"
+x
+```
+
+
+```{r}
+x = cbind(x, as.data.frame(flip(sapply(rownames(x), function(el){
+  unlist(cor.test(scRNA[[]][!scRNA$identity %in% c("immune", "vascular"),el], scRNA[[]][!scRNA$identity %in% c("immune", "vascular"),"Epilepsy1"])[c("p.value", "estimate")])
+}))))
+x$padjcor = p.adjust(x$p.value, method = "BH")
+x
+```
+```{r}
+dsigdb_res = x
+```
+```{r}
+dsigdb_res
+dsigdb_res$pharmaceutical  = gsub("DSIGDP_", "", gsub("1", "", dsigdb_res$name))
+```
+
+
+```{r}
+x = dsigdb_res[(!dsigdb_res$IDH=="ns")|(dsigdb_res$targets %in% c("glioma", "oligodendroglia", "astrocyte"))|(dsigdb_res$pharmaceutical %in% c("gabapentin", "pregabalin")),]
+x = x[!x$pharmaceutical %in% c("levetiracetam", "brivaracetam", "everolimus", "clonazepam", "lorazepam"),]
+x
+```
+
+```{r}
+df = NULL
+X = NULL
+for(el in unique(scRNA$identity)){
+  df = c(df, x[grepl(el, x$targets),"pharmaceutical"])
+  X = c(X, rep(el, times = length(x[grepl(el, x$targets),"pharmaceutical"])))
+}
+df = data.frame(feature = X, pharmaceutical = df)
+el = x[x$IDH == "mut", c("IDH", "pharmaceutical")]
+colnames(el) = c("feature", "pharmaceutical")
+df = rbind(df, el)
+
+el = x[x$IDH == "wt", c("IDH", "pharmaceutical")]
+colnames(el) = c("feature", "pharmaceutical")
+df = rbind(df, el)
+
+df
+```
+```{r}
+df$feature = gsub("glioma", "glioma cell", gsub("immune", "immune\ncell", gsub("mut", "IDHmut", gsub("wt", "IDHwt", df$feature))))
+```
+
+
+
+```{r}
+library(ggraph)
+```
+
+```{r}
+
+
+lapply(unique(c('stress', 'fr', 'lgl', 'graphopt', 'kk', 'drl', 'star', 'circle', 'gem', 'dh', 'graphopt', 'grid', 'mds', 'randomly', 'fr', 'kk', 'drl', 'lgl')), function(layout) {
+  set.seed(2021)
+  ggraph(df, layout = layout) + 
+    geom_edge_link() +
+    geom_node_label(aes(label = name)) +
+    labs(title = layout)
+})
+```
+
+```{r}
+set.seed(2021)
+f2 = function(x){
+  x[x %in% dsigdb_res$pharmaceutical] = "pharmaceutical"
+  return(x)
+}
+
+library(ggraph)
+library(tidygraph)
+df <- as_tbl_graph(df)
+p = ggraph(df, layout = "graphopt") + 
+  geom_point(data = data.frame(x = c(-10, 10), y = c(0, 0)), aes(x=x,y=y), color = "white") +
+  geom_edge_link() +
+  geom_node_label(aes(label = name, fill = f2(name))) +
+  scale_fill_manual(values = alpha(c("seashell4", "darkturquoise", "darkgreen", "darkgoldenrod1", "tomato", "darkorchid4", "white", "cyan", "darkgoldenrod"),1), breaks = c("glioma cell", "astrocyte", "oligodendroglia", "neuron", "vascular", "immune\ncell", "pharmaceutical", "IDHwt", "IDHmut")) +
+  theme_classic() + theme(legend.position = "none", axis.ticks.x = element_blank(), axis.text.x = element_blank(), axis.line.x = element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank(), axis.line.y = element_blank()) + labs(title = "Significant associations of single cell pharmaceutical signatures", x = "", y = "")
+
+ggsave(p, width = 8, height = 6, filename = "t1.png")
+```
+
+```{r}
+fig4sca_dsigdb = p
+setwd(paste0(wd, "/Figures"))
+ggsave(fig4sca_dsigdb, filename = "fig4sca_dsigdb.png", width = 8, height = 6, dpi = 400)
+
+save(fig4sca_dsigdb, dsigdb_res, f2, file = "fig4sca_dsigdb.Rdata")
+```
+```{r}
+f = function(x){
+  x = (x-min(x))/(max(x) - min(x))
+}
+
+
+df = data.frame(UMAP1 = scRNA@reductions$umap@cell.embeddings[,"UMAP_1"],
+                UMAP2 = scRNA@reductions$umap@cell.embeddings[,"UMAP_2"])
+
+p = list()
+
+for(el in c("Perampanel", "Gabapentin", "Clobazam", "Acetazolamide")){
+  df[,tolower(el)] = scRNA[[]][,paste0("DSIGDP_", tolower(el), "1")]
+  
+  p[[el]] = ggplot(data = df, aes_string(x = "UMAP1", y = "UMAP2", color = tolower(el))) + geom_point()  + scale_color_gradientn(name = "Seurat signature score", colors = alpha(c("blue4", "dodgerblue", "cyan",  "gray70", "yellow", "red", "magenta4"),0.5), values = f(quantile(df[,tolower(el)], seq(0, 1, 1/7)))) +
+    theme_classic() + theme(axis.ticks.x = element_blank(), plot.title = element_text(hjust = 0.5), axis.text.x = element_blank(), axis.line.x = element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank(), axis.line.y = element_blank()) + labs(title = el, x = "", y = "")
+}
+
+```
+
+
+```{r}
+fig4scp_dsigdb = p
+setwd(paste0(wd, "/Figures"))
+ggsave(ggarrange(plotlist = p, nrow = 2, ncol = 2, common.legend = T, legend = "bottom"), filename = "fig4scp_dsigdb.png", width = 8, height = 6, dpi = 400)
+
+save(fig4scp_dsigdb, f, file = "fig4scp_dsigdb.Rdata")
+```
+
+```{r}
+drh = drh[!sapply(sapply(drh, function(el){intersect(el, rownames(scRNA))}), length)==0]
+```
+
+
+```{r}
+for(el in names(drh)){
+  scRNA = AddModuleScore(scRNA, features = drh[el], name = gsub(" ", "_", paste0("DRH_", el)), assay = "SCT")
+}
+```
+
+
+```{r}
+scRNA[[]][,grepl("DRH", colnames(scRNA[[]]))]
+```
+
+```{r}
+x = data.frame(name = colnames(scRNA[[]])[grepl("DRH", colnames(scRNA[[]]))], p_KW = sapply(colnames(scRNA[[]])[grepl("DRH", colnames(scRNA[[]]))], function(el){
+  kruskal.test(as.formula(paste0(el, "~identity")), data = scRNA[[]])$p.value
+}))
+
+x
+```
+
+```{r}
+x$max = sapply(rownames(x), function(el){
+  x = tapply(scRNA[[]][,el], scRNA$identity, mean)
+  x = names(x)[x == max(x)]
+  return(x)
+})
+```
+
+
+
+
+
+```{r}
+x$targets = sapply(rownames(x), function(el){
+  X = dunnTest(as.formula(paste0(el, "~identity")), data = scRNA[[]], method = "bh")
+  X = cldList(P.adj ~ Comparison,data = X$res,threshold = 0.05)
+  X = X[grepl(X[X$Group == x[el,"max"],"Letter"], X$Letter),"Group"]
+  X = paste(X, collapse = "_")
+  return(X)
+})
+
+```
+```{r}
+x$p_IDH = sapply(rownames(x), function(el){
+  kruskal.test(as.formula(paste0(el, "~IDH")), data = scRNA[[]])$p.value
+})
+
+x$padj_IDH = p.adjust(x$p_IDH, method = "BH")
+
+x$IDH = sapply(rownames(x), function(el){
+  x = tapply(scRNA[[]][,el], scRNA$IDH, mean)
+  x = names(x)[x == max(x)]
+  return(x)
+})
+
+x$IDH[x$padj_IDH>0.05] = "ns"
+```
+
+
+
+
+
+```{r}
+x = cbind(x, as.data.frame(flip(sapply(rownames(x), function(el){
+  unlist(cor.test(scRNA[[]][!scRNA$identity %in% c("immune", "vascular"),el], scRNA[[]][!scRNA$identity %in% c("immune", "vascular"),"Epilepsy1"])[c("p.value", "estimate")])
+}))))
+x$padjcor = p.adjust(x$p.value, method = "BH")
+
+x
+```
+
+```{r}
+drh_res= x
+drh_res$pharmaceutical  = gsub("DRH_", "", gsub("1", "", drh_res$name))
+```
+
+
+```{r}
+drh_res[(!drh_res$IDH=="ns"),]
+```
+
+
+```{r}
+x = drh_res[(!drh_res$IDH=="ns")|(drh_res$targets %in% c("oligodendroglia"))|(drh_res$pharmaceutical %in% c("gabapentin", "pregabalin")),]
+x = x[!x$pharmaceutical %in% c("levetiracetam", "brivaracetam", "lorazepam", "clonazepam"),]
+x
+```
+
+```{r}
+p = matrix(0, nrow = length(c(unique(scRNA$identity), "IDHmut", "IDHwt")), ncol = length(x$pharmaceutical), dimnames = list(r = c(unique(scRNA$identity), "IDHmut", "IDHwt"), c = x$pharmaceutical))
+
+for(el in colnames(p)){
+  p[unlist(strsplit(drh_res[drh_res$pharmaceutical == el,"targets"], "_")),el] = 1
+}
+p["IDHmut",x[x$IDH == "mut","pharmaceutical"]] = 1
+p["IDHwt",x[x$IDH == "wt","pharmaceutical"]] = 1
+
+p
+```
+```{r}
+library(igraph)
+```
+
+
+
+```{r}
+df = NULL
+X = NULL
+for(el in unique(scRNA$identity)){
+  df = c(df, x[grepl(el, x$targets),"pharmaceutical"])
+  X = c(X, rep(el, times = length(x[grepl(el, x$targets),"pharmaceutical"])))
+}
+df = data.frame(feature = X, pharmaceutical = df)
+el = x[x$IDH == "mut", c("IDH", "pharmaceutical")]
+colnames(el) = c("feature", "pharmaceutical")
+df = rbind(df, el)
+
+el = x[x$IDH == "wt", c("IDH", "pharmaceutical")]
+colnames(el) = c("feature", "pharmaceutical")
+df = rbind(df, el)
+
+df$feature = gsub("glioma", "glioma cell", gsub("immune", "immune\ncell", gsub("mut", "IDHmut", gsub("wt", "IDHwt", df$feature))))
+
+df
+```
+
+
+
+
+
+
+
+```{r}
+library(ggraph)
+```
+
+```{r}
+set.seed(1995)
+
+lapply(c('stress', 'fr', 'lgl', 'graphopt'), function(layout) {
+  ggraph(df, layout = layout) + 
+    geom_edge_link() +
+    geom_node_label(aes(label = name)) 
+})
+```
+
+```{r}
+f2 = function(x){
+  x[x %in% drh_res$pharmaceutical] = "pharmaceutical"
+  return(x)
+}
+
+library(ggraph)
+library(tidygraph)
+df <- as_tbl_graph(df)
+p = ggraph(df, layout = "stress") + 
+  geom_point(data = data.frame(x = c(-4,-4, 4, 4), y = c(-1, 1, -1, 1)), aes(x=x,y=y), color = "white") +
+  geom_edge_link() +
+  geom_node_label(aes(label = name, fill = f2(name))) +
+  scale_fill_manual(values = alpha(c("seashell4", "darkturquoise", "darkgreen", "darkgoldenrod1", "tomato", "darkorchid4", "white", "cyan", "darkgoldenrod"),1), breaks = c("glioma cell", "astrocyte", "oligodendroglia", "neuron", "vascular", "immune\ncell", "pharmaceutical", "IDHwt", "IDHmut")) +
+  theme_classic() + theme(legend.position = "none", axis.ticks.x = element_blank(), axis.text.x = element_blank(), axis.line.x = element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank(), axis.line.y = element_blank()) + labs(title = "Significant associations of single cell pharmaceutical signatures", x = "", y = "")
+
+ggsave(p, width = 8, height = 6, filename = "t1.png")
+```
+
+```{r}
+
+```
+
+
+```{r}
+fig4sca_drh = p
+setwd(paste0(wd, "/Figures"))
+ggsave(fig4sca_drh, filename = "fig4sca_drh.png", width = 8, height = 6, dpi = 400)
+
+save(fig4sca_drh, f2, drh_res, file = "fig4sca_drh.Rdata")
+```
+```{r}
+f = function(x){
+  x = (x-min(x))/(max(x) - min(x))
+}
+
+
+df = data.frame(UMAP1 = scRNA@reductions$umap@cell.embeddings[,"UMAP_1"],
+                UMAP2 = scRNA@reductions$umap@cell.embeddings[,"UMAP_2"])
+
+p = list()
+
+for(el in c("Perampanel", "Gabapentin", "Clobazam", "Acetazolamide")){
+  df[,tolower(el)] = scRNA[[]][,paste0("DRH_", tolower(el), "1")]
+  
+  p[[el]] = ggplot(data = df, aes_string(x = "UMAP1", y = "UMAP2", color = tolower(el))) + geom_point()  + scale_color_gradientn(name = "Seurat signature score", colors = alpha(c("blue4", "dodgerblue", "cyan",  "gray70", "yellow", "red", "magenta4"),0.5), values = f(quantile(df[,tolower(el)], seq(0, 1, 1/7)))) +
+    theme_classic() + theme(axis.ticks.x = element_blank(), plot.title = element_text(hjust = 0.5), axis.text.x = element_blank(), axis.line.x = element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank(), axis.line.y = element_blank()) + labs(title = el, x = "", y = "")
+}
+
+```
+
+
+```{r}
+fig4scp_drh = p
+setwd(paste0(wd, "/Figures"))
+ggsave(ggarrange(plotlist = p, nrow = 2, ncol = 2, common.legend = T, legend = "bottom"), filename = "fig4scp_drh.png", width = 8, height = 6, dpi = 400)
+
+save(fig4scp_drh, f, file = "fig4scp_drh.Rdata")
+```
+
+```{r}
+dsigdb = dsigdb[!sapply(sapply(dsigdb, function(el){intersect(el, rownames(scRNA))}), length)==0]
+```
+
+
+```{r}
+for(el in names(dsigdb)){
+  scRNA = AddModuleScore(scRNA, features = dsigdb[el], name = gsub(" ", "_", paste0("DSIGDP_", el)), assay = "integrated")
+}
+```
+
+
+
+
+```{r}
+x = data.frame(name = colnames(scRNA[[]])[grepl("DSIGDP", colnames(scRNA[[]]))], p_KW = sapply(colnames(scRNA[[]])[grepl("DSIGDP", colnames(scRNA[[]]))], function(el){
+  kruskal.test(as.formula(paste0(el, "~identity")), data = scRNA[[]])$p.value
+}))
+
+x
+```
+
+```{r}
+x$max = sapply(rownames(x), function(el){
+  x = tapply(scRNA[[]][,el], scRNA$identity, mean)
+  x = names(x)[x == max(x)]
+  return(x)
+})
+```
+
+
+
+```{r}
+x$targets = sapply(rownames(x), function(el){
+  X = dunnTest(as.formula(paste0(el, "~identity")), data = scRNA[[]], method = "bh")
+  X = cldList(P.adj ~ Comparison,data = X$res,threshold = 0.05)
+  X = X[grepl(X[X$Group == x[el,"max"],"Letter"], X$Letter),"Group"]
+  X = paste(X, collapse = "_")
+  return(X)
+})
+
+x
+```
+```{r}
+x$p_IDH = sapply(rownames(x), function(el){
+  kruskal.test(as.formula(paste0(el, "~IDH")), data = scRNA[[]])$p.value
+})
+
+x$padj_IDH = p.adjust(x$p_IDH, method = "BH")
+
+x$IDH = sapply(rownames(x), function(el){
+  x = tapply(scRNA[[]][,el], scRNA$IDH, mean)
+  x = names(x)[x == max(x)]
+  return(x)
+})
+
+x$IDH[x$padj_IDH>0.05] = "ns"
+x
+```
+
+
+```{r}
+x = cbind(x, as.data.frame(flip(sapply(rownames(x), function(el){
+  unlist(cor.test(scRNA[[]][!scRNA$identity %in% c("immune", "vascular"),el], scRNA[[]][!scRNA$identity %in% c("immune", "vascular"),"Epilepsy1"])[c("p.value", "estimate")])
+}))))
+x$padjcor = p.adjust(x$p.value, method = "BH")
+x
+```
+```{r}
+dsigdb_res = x
+```
+```{r}
+dsigdb_res
+dsigdb_res$pharmaceutical  = gsub("DSIGDP_", "", gsub("1", "", dsigdb_res$name))
+```
+
+
+```{r}
+x = dsigdb_res[(!dsigdb_res$IDH=="ns")|(dsigdb_res$targets %in% c("glioma", "oligodendroglia", "astrocyte"))|(dsigdb_res$pharmaceutical %in% c("gabapentin", "pregabalin")),]
+x = x[!x$pharmaceutical %in% c("levetiracetam", "brivaracetam", "everolimus", "clonazepam", "lorazepam"),]
+x
+```
+
+```{r}
+df = NULL
+X = NULL
+for(el in unique(scRNA$identity)){
+  df = c(df, x[grepl(el, x$targets),"pharmaceutical"])
+  X = c(X, rep(el, times = length(x[grepl(el, x$targets),"pharmaceutical"])))
+}
+df = data.frame(feature = X, pharmaceutical = df)
+el = x[x$IDH == "mut", c("IDH", "pharmaceutical")]
+colnames(el) = c("feature", "pharmaceutical")
+df = rbind(df, el)
+
+el = x[x$IDH == "wt", c("IDH", "pharmaceutical")]
+colnames(el) = c("feature", "pharmaceutical")
+df = rbind(df, el)
+
+df
+```
+```{r}
+df$feature = gsub("glioma", "glioma cell", gsub("immune", "immune\ncell", gsub("mut", "IDHmut", gsub("wt", "IDHwt", df$feature))))
+```
+
+
+
+```{r}
+library(ggraph)
+```
+
+```{r}
+
+
+lapply(unique(c('stress', 'fr', 'lgl', 'graphopt', 'kk', 'drl', 'star', 'circle', 'gem', 'dh', 'graphopt', 'grid', 'mds', 'randomly', 'fr', 'kk', 'drl', 'lgl')), function(layout) {
+  set.seed(2021)
+  ggraph(df, layout = layout) + 
+    geom_edge_link() +
+    geom_node_label(aes(label = name)) +
+    labs(title = layout)
+})
+```
+
+```{r}
+set.seed(2021)
+f2 = function(x){
+  x[x %in% dsigdb_res$pharmaceutical] = "pharmaceutical"
+  return(x)
+}
+
+library(ggraph)
+library(tidygraph)
+df <- as_tbl_graph(df)
+p = ggraph(df, layout = "graphopt") + 
+  geom_point(data = data.frame(x = c(-10, 10), y = c(0, 0)), aes(x=x,y=y), color = "white") +
+  geom_edge_link() +
+  geom_node_label(aes(label = name, fill = f2(name))) +
+  scale_fill_manual(values = alpha(c("seashell4", "darkturquoise", "darkgreen", "darkgoldenrod1", "tomato", "darkorchid4", "white", "cyan", "darkgoldenrod"),1), breaks = c("glioma cell", "astrocyte", "oligodendroglia", "neuron", "vascular", "immune\ncell", "pharmaceutical", "IDHwt", "IDHmut")) +
+  theme_classic() + theme(legend.position = "none", axis.ticks.x = element_blank(), axis.text.x = element_blank(), axis.line.x = element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank(), axis.line.y = element_blank()) + labs(title = "Significant associations of single cell pharmaceutical signatures", x = "", y = "")
+
+ggsave(p, width = 8, height = 6, filename = "t1.png")
+```
+
+```{r}
+fig4sca_dsigdb = p
+setwd(paste0(wd, "/Figures"))
+ggsave(fig4sca_dsigdb, filename = "fig4sca_dsigdb.png", width = 8, height = 6, dpi = 400)
+
+save(fig4sca_dsigdb, dsigdb_res, f2, file = "fig4sca_dsigdb.Rdata")
+```
+
+```{r}
+f = function(x){
+  x = (x-min(x))/(max(x) - min(x))
+}
+
+
+df = data.frame(UMAP1 = scRNA@reductions$umap@cell.embeddings[,"UMAP_1"],
+                UMAP2 = scRNA@reductions$umap@cell.embeddings[,"UMAP_2"])
+
+p = list()
+
+for(el in c("Perampanel", "Gabapentin", "Clobazam", "Acetazolamide")){
+  df[,tolower(el)] = scRNA[[]][,paste0("DSIGDP_", tolower(el), "1")]
+  
+  p[[el]] = ggplot(data = df, aes_string(x = "UMAP1", y = "UMAP2", color = tolower(el))) + geom_point()  + scale_color_gradientn(name = "Seurat signature score", colors = alpha(c("blue4", "dodgerblue", "cyan",  "gray70", "yellow", "red", "magenta4"),0.5), values = f(quantile(df[,tolower(el)], seq(0, 1, 1/7)))) +
+    theme_classic() + theme(axis.ticks.x = element_blank(), plot.title = element_text(hjust = 0.5), axis.text.x = element_blank(), axis.line.x = element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank(), axis.line.y = element_blank()) + labs(title = el, x = "", y = "")
+}
+
+```
+
+
+```{r}
+fig4scp_dsigdb = p
+setwd(paste0(wd, "/Figures"))
+ggsave(ggarrange(plotlist = p, nrow = 2, ncol = 2, common.legend = T, legend = "bottom"), filename = "fig4scp_dsigdb.png", width = 8, height = 6, dpi = 400)
+
+save(fig4scp_dsigdb, f, file = "fig4scp_dsigdb.Rdata")
+```
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+#save(scRNA, file = "scRNA_3s_identified.Rdata")
+load(file = "scRNA_3s_identified.Rdata")
+load(file = "ig.Rdata")
+```
+
+```{r}
+scRNA = RunUMAP(scRNA, reduction.name = "UMAP3d", n.components = 3, dims = 1:30)
+```
+
+```{r}
+library(babyplots)
+library(gplots)
+```
+
+```{r}
+unique(scRNA$identity)
+```
+
+```{r}
+x = scRNA@reductions$UMAP3d@cell.embeddings
+colnames(x) = c("x", "y", "z")
+p = pointCloud(coords = x, colorBy = "categories", colorVar =  scRNA$identity, turntable = T, showUI = T, colorScale = "custom", customColorScale =  setNames(gplots::col2hex(c("seashell4", "darkturquoise", "darkgreen", "darkgoldenrod1", "tomato", "darkorchid4")), c("glioma", "astrocyte", "oligodendroglia", "neuron", "vascular", "immune")), size = 1.5) #colorScale = "custom", , 
+
+p
+```
+
+
+```{r}
+Idents(scRNA) = scRNA$identity
+glioma = subset(scRNA, idents = "glioma")
+glioma <- FindNeighbors(glioma, dims = 1:30)
+for(el in 0.1 + 0:19/10){
+  glioma <- FindClusters(glioma, resolution = el)
+}
+```
+
+```{r}
+glioma = RunUMAP(glioma, reduction.name = "UMAP3d", n.components = 3, dims = 1:30)
+```
+
+
+
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+df = glioma[[]]
+for(el in c("Epilepsy1", "NRSF1", "Epilepsy_neg1")){
+  #df[,el] = ifelse(df$prim_ident == el, 1, 0)
+  p = clustree(df, prefix = "integrated_snn_res.", node_colour = el, node_colour_aggr = "mean") + scale_color_gradientn(colors = rev(hcl.colors(9, "heat"))) + ggtitle(el)
+  ggsave(p, filename = paste0("Clustree_glioma_", el, ".png"), width = 10, height = 8, dpi = 400)
+}
+```
+```{r}
+x = glioma@reductions$UMAP3d@cell.embeddings
+colnames(x) = c("x", "y", "z")
+p = pointCloud(coords = x, colorBy = "categories", colorVar =  glioma$integrated_snn_res.0.5, turntable = T, showUI = T,  size = 1.5)
+
+p
+```
+
+```{r}
+x = glioma@reductions$UMAP3d@cell.embeddings
+colnames(x) = c("x", "y", "z")
+p = pointCloud(coords = x, colorBy = "values", colorVar =  glioma$NRSF1,colorScale = "PiYG", turntable = T, showUI = T,  size = 3)
+
+p
+```
+
+```{r}
+x = glioma@reductions$UMAP3d@cell.embeddings
+colnames(x) = c("x", "y", "z")
+p = pointCloud(coords = x, colorBy = "values", colorVar =  glioma$Epilepsy1,colorScale = "PiYG", turntable = T, showUI = T,  size = 3)
+
+p
+```
+
+
+```{r}
+library(dyno)
+library(tidyverse)
+```
+
+```{r}
+dynwrap::test_docker_installation(detailed = TRUE)
+```
+
+
+
+
+```{r}
+dataset <- wrap_expression(
+  counts = flip(glioma@assays$RNA@counts[rownames(glioma@assays$integrated@scale.data),]),
+  expression = flip(glioma@assays$integrated@scale.data)
+)
+```
+
+```{r}
+#dp = add_prior_information(dataset, start_id = rownames(GBM[[]][GBM$integrated_snn_res.1 == "1" & GBM$stemness > quantile(GBM$stemness, seq(0,1,0.1))["90%"],]))
+model.slingshot <- infer_trajectory(dataset, "slingshot")
+setwd(paste0(wd, "/scRNA_res"))
+save(model.slingshot, file = "model.slingshot.Rdata")
+
+#model.mst = simplify_trajectory(model.mst)
+```
+
+```{r}
+glioma$pseudotime = calculate_pseudotime(model.slingshot)
+```
+
+```{r}
+x = glioma@reductions$UMAP3d@cell.embeddings
+colnames(x) = c("x", "y", "z")
+p = pointCloud(coords = x, colorBy = "values", colorVar =  glioma$pseudotime ,colorScale = "RdYlBu", turntable = T, showUI = T,  size = 3)
+
+p
+```
+
+```{r}
+glioma$ptc = group_onto_nearest_milestones(model.slingshot)
+```
+
+```{r}
+x = glioma@reductions$UMAP3d@cell.embeddings
+colnames(x) = c("x", "y", "z")
+p = pointCloud(coords = x, colorBy = "categories", colorVar =  glioma$ptc, turntable = T, showUI = T,  size = 1.5)
+
+p
+```
+
+```{r}
+x = dunnTest(Epilepsy1 ~ ptc, data = glioma[[]], method = "bh")
+x
+cldList(P.adj ~ Comparison,data = x$res,threshold = 0.05) 
+
+#  X = dunnTest(as.formula(paste0(el, "~identity")), data = scRNA[[]], method = "bh")
+#  X = cldList(P.adj ~ Comparison,data = X$res,threshold = 0.05)
+#  X = X[grepl(X[X$Group == x[el,"max"],"Letter"], X$Letter),"Group"]
+#  X = paste(X, collapse = "_")
+```
+
+```{r}
+tapply(glioma$Epilepsy1, glioma$integrated_snn_res.0.5, mean)[order(tapply(glioma$Epilepsy1, glioma$integrated_snn_res.0.5, mean), decreasing = T)]
+```
+```{r}
+tapply(glioma$NRSF1, glioma$integrated_snn_res.0.5, mean)[order(decreasing = T, tapply(glioma$NRSF1, glioma$integrated_snn_res.0.5, mean))]
+```
+
+```{r}
+tapply(glioma$Epilepsy1, glioma$ptc, mean)[order(tapply(glioma$Epilepsy1, glioma$ptc, mean), decreasing = T)]
+```
+```{r}
+tapply(glioma$NRSF1, glioma$ptc, mean)[order(decreasing = T, tapply(glioma$NRSF1, glioma$ptc, mean))]
+```
+
+```{r}
+x = glioma[[]][glioma$integrated_snn_res.0.5 %in% c("1", "2", "6"),]
+cor.test(x$Epilepsy1, x$NRSF1)
+```
+```{r}
+library(ggpubr)
+
+ggviolin(x = "ptc", y = "Epilepsy1", data = glioma[[]])
+```
+
+
+```{r}
+plot_dendro(model.slingshot, grouping = glioma$ptc)
+```
+
+
+```{r}
+el= "Verhaak"
+DimPlot(glioma,group.by = el, pt.size = 1, reduction = "umap", label = T) + scale_color_manual(values = alpha(rainbow(length(unique(dropNA(glioma[[]][,el])))), 0.5), na.value = "gray")
+```
+```{r}
+el = glioma$VERHAAK_GLIOBLASTOMA_NEURAL1
+```
+
+
+
+```{r}
+#scRNA = AddModuleScore(scRNA, features =  m["REST"] , name = "NRSF", ctrl = 100, assay = "integrated")
+#scRNA = AddModuleScore(scRNA, features =  m["CE_EPILEPSY_UP"] , name = "Epilepsy", ctrl = 100, assay = "integrated")
+#scRNA = AddModuleScore(scRNA, features =  m["CE_EPILEPSY_DN"] , name = "Epilepsy_neg", ctrl = 100, assay = "integrated")
+scRNA = AddModuleScore(scRNA, features =  m["LEIN_ASTROCYTE_MARKERS"] , name = "Lein_AS", ctrl = 100, assay = "integrated")
+scRNA = AddModuleScore(scRNA, features =  m["LEIN_OLIGODENDROCYTE_MARKERS"] , name = "Lein_OG", ctrl = 100, assay = "integrated")
+```
+
+
+
+
+
+
+
+```{r}
+f = function(x){
+  x = (x-min(x))/(max(x) - min(x))
+}
+
+x = setNames(c(quantile(df$REST), min(df$REST), max(df$REST)), c("dodgerblue", "cyan",  "gray70", "yellow", "red",  "blue4", "magenta4"))
+
+x = x[!duplicated(x)]
+
+x = x[order(x)]
+
+p = ggplot(data = df, aes(x = UMAP1, y = UMAP2, color = REST)) +
+  geom_point() + scale_color_gradientn(colors = alpha(names(x),0.5), values = f(x), name = "Seurat\nscore") +theme_classic() + labs(title = "REST regulated genes signature", x = "UMAP 1", y = "UMAP 2") + 
+  theme(axis.ticks.x = element_blank(), axis.text.x = element_blank(), axis.line.x = element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank(), axis.line.y = element_blank())
+
+p
+```
+
+
+
+```{r}
+x = setNames(c(quantile(df$Epilepsy), min(df$Epilepsy), max(df$Epilepsy)), c("dodgerblue", "cyan",  "gray70", "yellow", "red",  "blue4", "magenta4")) 
+
+x = x[!duplicated(x)]
+
+x = x[order(x)]
+
+p = ggplot(data = df, aes(x = UMAP1, y = UMAP2, color = Epilepsy)) +
+  geom_point() + scale_color_gradientn(colors = alpha(names(x),0.5), values = f(x), name = "Seurat\nscore") +theme_classic()  + labs(title = "Genes upregulated in epilepsy signature", x = "UMAP 1", y = "UMAP 2") + 
+  theme(axis.ticks.x = element_blank(), axis.text.x = element_blank(), axis.line.x = element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank(), axis.line.y = element_blank())
+
+p
+```
+
+
+```{r}
+
+```
+
+```{r}
+gexp(scRNA, "MCM2", "UMAP")
+```
+
+
+
+```{r}
+library(dyno)
+library(tidyverse)
+```
+
+```{r}
+dynwrap::test_docker_installation(detailed = TRUE)
+```
+
+```{r}
+ig = intersect(rownames(scRNA), ig)
+```
+
+
+```{r}
+dataset <- wrap_expression(
+  counts = flip(scRNA@assays$RNA@counts[ig,]),
+  expression = flip(scRNA@assays$integrated@scale.data[ig,])
+)
+```
+
+```{r}
+#dp = add_prior_information(dataset, start_id = rownames(GBM[[]][GBM$integrated_snn_res.1 == "1" & GBM$stemness > quantile(GBM$stemness, seq(0,1,0.1))["90%"],]))
+model.mst <- infer_trajectory(dataset, "mst")
+
+#model.mst = simplify_trajectory(model.mst)
+```
+
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+
+p = plot_dimred(model.mst, expression_source = dataset$expression, dimred = scRNA@reductions$umap@cell.embeddings)
+p = p + labs(title = "mst")
+p = ggplot_build(p)
+p$data[[1]]$colour = "white"
+p$data[[2]]$alpha = 0.5
+#p
+p=ggplot_gtable(p)
+
+ggsave(plot = p, filename = "mst.png")
+```
+
+
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+model.mst = add_root_using_expression(trajectory = model.mst, features_oi = "EZH2", expression_source = dataset$expression)
+
+p = plot_dimred(model.mst, expression_source = dataset$expression, dimred = scRNA@reductions$umap@cell.embeddings)
+p = p + labs(title = "mst")
+p = ggplot_build(p)
+p$data[[1]]$colour = "white"
+p$data[[2]]$alpha = 0.5
+#p
+p=ggplot_gtable(p)
+
+ggsave(plot = p, filename = "mst_MCM2.png")
+p
+```
+
+
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+
+
+x = setNames(c(quantile(df$Epilepsy[df$identity=="glioma"]), min(df$Epilepsy), max(df$Epilepsy)), c("dodgerblue", "cyan",  "gray70", "yellow", "red",  "blue4", "magenta4")) 
+
+x = x[!duplicated(x)]
+
+x = x[order(x)]
+
+p = plot_dendro(model.mst, color_cells = "feature", expression_source = as.matrix(scRNA[[]][rownames(dataset$counts),c("Epilepsy1", "Epilepsy_neg1", "NRSF1")]), feature_oi = "Epilepsy1", border_radius_percentage = 0)
+
+p = p + scale_color_gradientn(colors = alpha(names(x),1), values = f(x), name = "Seurat\nscore")
+
+p = ggplot_build(p)
+#p$data[[1]]$colour = "white"
+p$data[[3]]$alpha = 0.4
+p=ggplot_gtable(p)
+
+ggsave(plot = p, filename = "mst_dendro_Epi.png")
+```
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+
+
+x = setNames(c(quantile(df$Epilepsy[df$identity=="glioma"]), min(df$Epilepsy), max(df$Epilepsy)), c("dodgerblue", "cyan",  "gray70", "yellow", "red",  "blue4", "magenta4")) 
+
+x = x[!duplicated(x)]
+
+x = x[order(x)]
+
+p = plot_dendro(model.mst, color_cells = "feature", expression_source = as.matrix(scRNA[[]][rownames(dataset$counts),c("Epilepsy1", "Epilepsy_neg1", "NRSF1")]), feature_oi = "NRSF1", border_radius_percentage = 0)
+
+p = p + scale_color_gradientn(colors = alpha(names(x),1), values = f(x), name = "Seurat\nscore")
+
+p = ggplot_build(p)
+#p$data[[1]]$colour = "white"
+p$data[[3]]$alpha = 0.4
+p=ggplot_gtable(p)
+
+ggsave(plot = p, filename = "mst_dendro_REST.png")
+```
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+
+
+x = setNames(c(quantile(df$Epilepsy[df$identity=="glioma"]), min(df$Epilepsy), max(df$Epilepsy)), c("dodgerblue", "cyan",  "gray70", "yellow", "red",  "blue4", "magenta4")) 
+
+x = x[!duplicated(x)]
+
+x = x[order(x)]
+
+p = plot_dendro(model.mst, color_cells = "feature", expression_source = as.matrix(scRNA[[]][rownames(dataset$counts),c("Epilepsy1", "Epilepsy_neg1", "NRSF1")]), feature_oi = "Epilepsy_neg1", border_radius_percentage = 0)
+
+p = p + scale_color_gradientn(colors = alpha(names(x),1), values = f(x), name = "Seurat\nscore")
+
+p = ggplot_build(p)
+#p$data[[1]]$colour = "white"
+p$data[[3]]$alpha = 0.4
+p=ggplot_gtable(p)
+
+ggsave(plot = p, filename = "mst_dendro_nEpi.png")
+```
+
+
+
+
+
+
+```{r}
+p = plot_dendro(model.mst, alpha_cells = 0.5, border_radius_percentage = 0, diag_offset = 0.02, y_offset = 0.2, color_milestones = "given", milestones = tibble(milestone_id = paste0("M", 1:15), color = c(M1 = "brown", M2 = "purple", M3 = "purple", M4 = "gray", M5 = "darkturquoise", M6 = "brown", M7 = "brown", M8 = "purple", M9 = "navyblue", M10 = "brown", M11 = "darkturquoise", M12 = "darkturquoise", M13 = "navyblue", M14 = "purple", M15 = "navyblue")))
+p
+```
+
+```{r}
+features <- calculate_overall_feature_importance(model.mst, expression_source = dataset)
+```
+
+```{r}
+
+```
+
+
+
+
+
+```{r}
+plot_dimred(model.mst, expression_source = dataset$expression, dimred = scRNA@reductions$umap@cell.embeddings, alpha_cells = 0.5, border_radius_percentage = 0, color_milestones = "given", milestones = tibble(milestone_id = paste0("M", 1:15), color = c(M1 = "red", M2 = "purple", M3 = "purple", M4 = "gray", M5 = "cyan", M6 = "red", M7 = "red", M8 = "gray", M9 = "blue", M10 = "red", M11 = "cyan", M12 = "cyan", M13 = "blue", M14 = "purple", M15 = "blue")))
+```
+
+```{r}
+tibble(milestones = paste0("M", 1:15), color_cells = c(M1 = "red", M2 = "purple", M3 = "purple", M4 = "gray", M5 = "cyan", M6 = "red", M7 = "red", M8 = "purple", M9 = "blue", M10 = "blue", M11 = "blue", M12 = "cyan", M13 = "blue", M14 = "purple", M15 = "blue"))
+```
+
+
+```{r}
+#x = (simplify_trajectory(model.mst))
+plot_dendro(model.mst, grouping = group_onto_nearest_milestones(model.mst))
+```
+
+
+```{r}
+scRNA$pseudotime = calculate_pseudotime(model.mst)
+
+x = tibble(milestone_id = paste0("M", 1:15), color = c(M1 = "brown", M2 = "purple", M3 = "purple", M4 = "gray", M5 = "darkturquoise", M6 = "brown", M7 = "brown", M8 = "purple", M9 = "navyblue", M10 = "brown", M11 = "darkturquoise", M12 = "darkturquoise", M13 = "navyblue", M14 = "purple", M15 = "navyblue"))
+
+ x[match(group_onto_nearest_milestones(model.mst), x$milestone_id),"color"]
+```
+
+```{r}
+x = tibble(milestone_id = paste0("M", 1:15), color = c(M1 = "brown", M2 = "purple", M3 = "purple", M4 = "gray", M5 = "darkturquoise", M6 = "brown", M7 = "brown", M8 = "purple", M9 = "navyblue", M10 = "brown", M11 = "darkturquoise", M12 = "darkturquoise", M13 = "navyblue", M14 = "purple", M15 = "navyblue"))
+
+scRNA$pt_cluster = x$color[match(group_onto_nearest_milestones(model.mst), x$milestone_id)]
+```
+
+
+```{r}
+ggviolin(scRNA[[]], x = "pt_cluster", y = "Epilepsy1", fill = "pt_cluster", add = "boxplot", add.params = list(fill = "white")) + stat_compare_means(label = "p.signif", method = "wilcox.test", ref.group = "navyblue") 
+```
+
+```{r}
+ggviolin(scRNA[[]], x = "pt_cluster", y = "Epilepsy1", fill = "pt_cluster", add = "boxplot", add.params = list(fill = "white")) + stat_compare_means(label = "p.signif", method = "wilcox.test", ref.group = "navyblue") 
+```
+
+```{r}
+
+```
+
+
+
+```{r}
+plot_heatmap(simplify_trajectory(model.mst), expression_source = dataset, features_oi = features$feature_id[1:40], grouping = scRNA$pt_cluster)
+```
+
+
+```{r}
+xtabs(~identity + pt_cluster, data = scRNA[[]])
+```
+
+```{r}
+x = c(,,,)
+#guidelines <- guidelines_shiny(dataset)
+#guidelines$methods
+```
+
+```{r}
+#guidelines$methods_selected
+```
+
+
+```{r}
+#dp = add_prior_information(dataset, start_id = rownames(GBM[[]][GBM$integrated_snn_res.1 == "1" & GBM$stemness > quantile(GBM$stemness, seq(0,1,0.1))["90%"],]))
+model.slingshot <- infer_trajectory(dataset, "slingshot")
+
+#model.slingshot = simplify_trajectory(model.slingshot)
+```
+
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+
+p = plot_dimred(model.slingshot, expression_source = dataset$expression, dimred = scRNA@reductions$umap@cell.embeddings)
+p = p + labs(title = "slingshot")
+p = ggplot_build(p)
+p$data[[1]]$colour = "white"
+p$data[[2]]$alpha = 0.5
+#p
+p=ggplot_gtable(p)
+
+ggsave(plot = p, filename = "slingshot.png")
+```
+
+
+```{r}
+```
+
+```{r}
+model.slingshot = add_root_using_expression(trajectory = model.slingshot, features_oi = "MCM2", expression_source = dataset$expression)
+
+p = plot_dimred(model.slingshot, expression_source = dataset$expression, dimred = scRNA@reductions$umap@cell.embeddings)
+p = p + labs(title = "slingshot")
+p = ggplot_build(p)
+p$data[[1]]$colour = "white"
+p$data[[2]]$alpha = 0.5
+#p
+p=ggplot_gtable(p)
+
+ggsave(plot = p, filename = "slingshot_MCM2.png")
+p
+```
+
+
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+
+
+x = setNames(c(quantile(df$Epilepsy[df$identity=="glioma"]), min(df$Epilepsy), max(df$Epilepsy)), c("dodgerblue", "cyan",  "gray70", "yellow", "red",  "blue4", "magenta4")) 
+
+x = x[!duplicated(x)]
+
+x = x[order(x)]
+
+p = plot_dendro(model.slingshot, color_cells = "feature", expression_source = as.matrix(scRNA[[]][rownames(dataset$counts),c("Epilepsy1", "Epilepsy_neg1", "NRSF1")]), feature_oi = "Epilepsy1", border_radius_percentage = 0)
+
+p = p + scale_color_gradientn(colors = alpha(names(x),1), values = f(x), name = "Seurat\nscore")
+
+p = ggplot_build(p)
+#p$data[[1]]$colour = "white"
+p$data[[3]]$alpha = 0.4
+p=ggplot_gtable(p)
+
+ggsave(plot = p, filename = "slingshot_dendro_Epi.png")
+```
+
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+
+
+x = setNames(c(quantile(df$Epilepsy[df$identity=="glioma"]), min(df$Epilepsy), max(df$Epilepsy)), c("dodgerblue", "cyan",  "gray70", "yellow", "red",  "blue4", "magenta4")) 
+
+x = x[!duplicated(x)]
+
+x = x[order(x)]
+
+p = plot_dendro(model.slingshot, color_cells = "feature", expression_source = as.matrix(scRNA[[]][rownames(dataset$counts),c("Epilepsy1", "Epilepsy_neg1", "NRSF1")]), feature_oi = "Epilepsy_neg1", border_radius_percentage = 0)
+
+p = p + scale_color_gradientn(colors = alpha(names(x),1), values = f(x), name = "Seurat\nscore")
+
+p = ggplot_build(p)
+#p$data[[1]]$colour = "white"
+p$data[[3]]$alpha = 0.4
+p=ggplot_gtable(p)
+
+ggsave(plot = p, filename = "slingshot_dendro_nEpi.png")
+```
+
+
+```{r}
+#dp = add_prior_information(dataset, start_id = rownames(GBM[[]][GBM$integrated_snn_res.1 == "1" & GBM$stemness > quantile(GBM$stemness, seq(0,1,0.1))["90%"],]))
+model.mst <- infer_trajectory(dataset, "mst")
+
+#model.mst = simplify_trajectory(model.mst)
+```
+
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+
+p = plot_dimred(model.mst, expression_source = dataset$expression, dimred = scRNA@reductions$umap@cell.embeddings)
+p = p + labs(title = "mst")
+p = ggplot_build(p)
+p$data[[1]]$colour = "white"
+p$data[[2]]$alpha = 0.5
+#p
+p=ggplot_gtable(p)
+
+ggsave(plot = p, filename = "mst.png")
+```
+
+
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+model.mst = add_root_using_expression(trajectory = model.mst, features_oi = "MCM2", expression_source = dataset$expression)
+
+p = plot_dimred(model.mst, expression_source = dataset$expression, dimred = scRNA@reductions$umap@cell.embeddings)
+p = p + labs(title = "mst")
+p = ggplot_build(p)
+p$data[[1]]$colour = "white"
+p$data[[2]]$alpha = 0.5
+#p
+p=ggplot_gtable(p)
+
+ggsave(plot = p, filename = "mst_MCM2.png")
+p
+```
+
+
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+
+
+x = setNames(c(quantile(df$Epilepsy[df$identity=="glioma"]), min(df$Epilepsy), max(df$Epilepsy)), c("dodgerblue", "cyan",  "gray70", "yellow", "red",  "blue4", "magenta4")) 
+
+x = x[!duplicated(x)]
+
+x = x[order(x)]
+
+p = plot_dendro(model.mst, color_cells = "feature", expression_source = as.matrix(scRNA[[]][rownames(dataset$counts),c("Epilepsy1", "Epilepsy_neg1", "NRSF1")]), feature_oi = "Epilepsy1", border_radius_percentage = 0)
+
+p = p + scale_color_gradientn(colors = alpha(names(x),1), values = f(x), name = "Seurat\nscore")
+
+p = ggplot_build(p)
+#p$data[[1]]$colour = "white"
+p$data[[3]]$alpha = 0.4
+p=ggplot_gtable(p)
+
+ggsave(plot = p, filename = "mst_dendro_Epi.png")
+```
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+
+
+x = setNames(c(quantile(df$Epilepsy[df$identity=="glioma"]), min(df$Epilepsy), max(df$Epilepsy)), c("dodgerblue", "cyan",  "gray70", "yellow", "red",  "blue4", "magenta4")) 
+
+x = x[!duplicated(x)]
+
+x = x[order(x)]
+
+p = plot_dendro(model.mst, color_cells = "feature", expression_source = as.matrix(scRNA[[]][rownames(dataset$counts),c("Epilepsy1", "Epilepsy_neg1", "NRSF1")]), feature_oi = "NRSF1", border_radius_percentage = 0)
+
+p = p + scale_color_gradientn(colors = alpha(names(x),1), values = f(x), name = "Seurat\nscore")
+
+p = ggplot_build(p)
+#p$data[[1]]$colour = "white"
+p$data[[3]]$alpha = 0.4
+p=ggplot_gtable(p)
+
+ggsave(plot = p, filename = "mst_dendro_REST.png")
+```
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+
+
+x = setNames(c(quantile(df$Epilepsy[df$identity=="glioma"]), min(df$Epilepsy), max(df$Epilepsy)), c("dodgerblue", "cyan",  "gray70", "yellow", "red",  "blue4", "magenta4")) 
+
+x = x[!duplicated(x)]
+
+x = x[order(x)]
+
+p = plot_dendro(model.mst, color_cells = "feature", expression_source = as.matrix(scRNA[[]][rownames(dataset$counts),c("Epilepsy1", "Epilepsy_neg1", "NRSF1")]), feature_oi = "Epilepsy_neg1", border_radius_percentage = 0)
+
+p = p + scale_color_gradientn(colors = alpha(names(x),1), values = f(x), name = "Seurat\nscore")
+
+p = ggplot_build(p)
+#p$data[[1]]$colour = "white"
+p$data[[3]]$alpha = 0.4
+p=ggplot_gtable(p)
+
+ggsave(plot = p, filename = "mst_dendro_nEpi.png")
+```
+
+```{r}
+plot_dendro(model.mst, milestones = T)
+```
+```{r}
+x = (simplify_trajectory(model.mst))
+plot_dendro(x, grouping = group_onto_nearest_milestones(model.mst))
+```
+
+
+```{r}
+scRNA$pseudotime = calculate_pseudotime(model.mst)
+scRNA$pt_cluster = group_onto_nearest_milestones(model.mst)
+cor.test(scRNA$pseudotime, scRNA$Epilepsy1)
+```
+
+```{r}
+xtabs(~identity + pt_cluster, data = scRNA[[]])
+```
+
+```{r}
+ggviolin(scRNA[[]], x = "pt_cluster", y = "Epilepsy1", fill = "pt_cluster", add = "boxplot", add.params = list(fill = "white")) + stat_compare_means(label = "p.signif", method = "wilcox.test", ref.group = "M9") 
+```
+```{r}
+DimPlot(scRNA, group.by = "pt_cluster", label = T)
+```
+
+
+```{r}
+x = c(,,,)
+cor.test(scRNA[[]][!scRNA$pt_cluster %in% c("M2","M3","M5","M14"), ]$pseudotime, scRNA[[]][!scRNA$pt_cluster %in% c("M2","M3","M5","M14"), ]$Epilepsy1)
+```
+```{r}
+plot(x= scRNA[[]][!scRNA$pt_cluster %in% c("M2","M3","M5","M14"), ]$pseudotime, y = scRNA[[]][!scRNA$pt_cluster %in% c("M2","M3","M5","M14"), ]$Epilepsy1)
+```
+
+
+```{r}
+x = c(,,,)
+setwd(paste0(wd, "/scRNA_res"))
+
+p = plot_dimred(model.slingshot, expression_source = dataset$expression)
+p = p + labs(title = "slingshot")
+p = ggplot_build(p)
+p$data[[1]]$colour = "white"
+p$data[[2]]$alpha = 0.5
+#p
+p=ggplot_gtable(p)
+
+ggsave(plot = p, filename = "slingshot_native.png")
+```
+```{r}
+gexp(scRNA, "EZH2", "umap")
+```
+
+```{r}
+x = c(,,,)
+
+```
+
+
+
+```{r}
+FeaturePlot(glioma, features = "KLM4", reduction = "umap2", slot = "data")
+```
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+model.slingshot = add_root_using_expression(trajectory = model.slingshot, features_oi = "SOX2", expression_source = dataset$expression)
+p = plot_dimred(model.slingshot, expression_source = dataset$expression, dimred = glioma@reductions$umap@cell.embeddings)
+p = p + labs(title = "slingshot") + coord_fixed()
+p = ggplot_build(p)
+p$data[[1]]$colour = "white"
+p$data[[2]]$alpha = 0.5
+#p
+p=ggplot_gtable(p)
+
+ggsave(plot = p, filename = "slingshot2.png")
+```
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+
+#model.mst <- infer_trajectory(dataset, "mst",)
+
+#model.mst = simplify_trajectory(model.mst)
+p = plot_dimred(model.mst, expression_source = dataset$expression, dimred = glioma@reductions$umap2@cell.embeddings) #
+p = p + labs(title = "mst")
+p = ggplot_build(p)
+p$data[[1]]$colour = "white"
+p$data[[2]]$alpha = 0.5
+#p
+p=ggplot_gtable(p)
+
+ggsave(plot = p, filename = "mst.png")
+```
+
+
+```{r}
+```
+
+
+```{r}
+plot_dimred(model.scorpius, expression_source = dataset$expression, grouping = glioma$integrated_snn_res.0.8)
+```
+
+```{r}
+setwd(paste0(wd, "/scRNA_res"))
+
+model.paga_tree <- infer_trajectory(add_prior_information(dataset, start_id =  colnames(glioma)[glioma$integrated_snn_res.0.8 == "6"]), "paga_tree",)
+
+p = plot_dimred(model.paga_tree, expression_source = dataset$expression, dimred = glioma@reductions$umap@cell.embeddings)
+p = p + labs(title = "paga_tree")
+p = ggplot_build(p)
+p$data[[1]]$colour = "white"
+p$data[[2]]$alpha = 0.5
+#p
+p=ggplot_gtable(p)
+
+ggsave(plot = p, filename = "paga_tree.png")
+```
+
+
+```{r}
+#dp = add_prior_information(dataset, start_id = rownames(GBM[[]][GBM$integrated_snn_res.1 == "1" & GBM$stemness > quantile(GBM$stemness, seq(0,1,0.1))["90%"],]))
+model.mst <- infer_trajectory(dataset, "mst")
+
+model.mst = simplify_trajectory(model.mst)
+
+setwd(paste0(wd, "/scRNA_res"))
+
+p = plot_dimred(model.mst, expression_source = dataset$expression, dimred = GBM@reductions$umap@cell.embeddings)
+p = p + labs(title = "mst", x = "umap 1", y = "umap 2")
+p = ggplot_build(p)
+p$data[[1]]$colour = "white"
+p$data[[2]]$alpha = 0.5
+#p
+p=ggplot_gtable(p)
+
+ggsave(plot = p, filename = "mst.png")
+```
+
+
+
+```{r}
+model.slingshot <- infer_trajectory(dataset, "slingshot")
+features.slingshot = calculate_overall_feature_importance(model.slingshot, expression_source = dataset)
+```
+
+```{r}
+p = plot_dimred(model.slingshot, expression_source = dataset$expression, dimred = GBM@reductions$tsne@cell.embeddings)
+p = p + labs(title = "Slingshot", x = "tsne 1", y = "tsne 2")
+p = ggplot_build(p)
+p$data[[1]]$colour = "white"
+p$data[[2]]$alpha = 0.5
+#p
+p=ggplot_gtable(p)
+```
+```{r}
+ggsave(plot = p, filename = "p1.png")
+```
+
+```{r}
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.

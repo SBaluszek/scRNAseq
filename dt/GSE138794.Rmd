@@ -1,0 +1,1686 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+rm(list=ls())
+```
+
+
+```{r}
+#library(GEOquery)
+
+#GSE138794 = getGEO("GSE138794")
+
+'filePaths = getGEOSuppFiles("GSE138794")
+#filePaths
+#GSE138794 = getGEO("GSE138794")'
+```
+
+
+```{r}
+library(Seurat)
+library(xlsx)
+library(Matrix)
+library(future)
+library(biomaRt)
+library(ggplot2)
+library(scds)
+library(SingleR)
+plan("multiprocess", workers = 4)
+```
+
+
+
+```{r}
+library(Matrix)
+setwd(paste(getwd(), "/GSE138794", sep = ""))
+meta = read.xlsx("GSE138794_series_matrix.xlsx", 2)
+meta
+
+#setwd(paste(getwd(), "/GSE138794", sep = ""))
+for(el in 1:(length(meta[grepl("scRNA-Seq", meta$X.Sample_title),1]))){
+  x = readMM(strsplit(as.character(meta[grepl("scRNA-Seq", meta$X.Sample_title),][el,"X.Sample_supplementary_file_3"]), "/")[[1]][9])
+  x@Dimnames[[2]] = as.character(read.table(strsplit(as.character(meta[grepl("scRNA-Seq", meta$X.Sample_title),][el,"X.Sample_supplementary_file_1"]), "/")[[1]][9])$V1)
+  x@Dimnames[[1]] = as.character(read.table(strsplit(as.character(meta[grepl("scRNA-Seq", meta$X.Sample_title),][el,"X.Sample_supplementary_file_2"]), "/")[[1]][9])$V1)
+  assign(strsplit(strsplit(as.character(meta[grepl("scRNA-Seq", meta$X.Sample_title),][el,"X.Sample_supplementary_file_3"]), "/")[[1]][9], "_")[[1]][1], x)
+}
+meta
+```
+
+```{r}
+meta$name = sapply(strsplit(sapply(strsplit(as.character(meta[,"X.Sample_supplementary_file_3"]), "/"), function(x){x[9]}), "_"), function(x){x[1]})
+```
+
+
+
+
+
+
+
+
+
+```{r}
+library(SingleR)
+scRNA.ds = as.character(meta[grepl("scRNA-Seq", meta$X.Sample_title),"name"])
+'for(el in c("GSM4119537","GSM4119538")){
+  scRNA.ds = scRNA.ds[!scRNA.ds==el]
+}'
+#scRNA.ds = scRNA.ds[1:3]
+
+
+reference <- BlueprintEncodeData()
+
+scRNA.assays = list()
+for(el in scRNA.ds){
+  x = CreateSeuratObject(counts = get(el), project = el, min.cells = 5, min.features = 200)
+  x <- PercentageFeatureSet(x, pattern = "^MT-", col.name = "percent.mt")
+  doublet = cxds_bcds_hybrid(as.SingleCellExperiment(x), estNdbl = T)
+  common <- intersect(rownames(x@assays$RNA@data), rownames(reference))
+  singler <- reference[common,]
+  singler <- SingleR(test = as.matrix(x@assays$RNA@data[common,]), ref = singler, labels = singler$label.main)
+
+  x[["singleR"]] = singler$pruned.labels
+  x[["cxds_score"]] = doublet$cxds_score
+  x[["bcds_score"]] = doublet$bcds_score
+  x[["hybrid_score"]] = doublet$hybrid_score
+  x[["Doublet"]] = ifelse(doublet$hybrid_call, "yes", "no")
+  x[["Histology"]] = gsub("genotype/variation: ", "", meta[match(el, meta$name),"X.Sample_characteristics_ch1.2"])
+  x[["Age"]] = as.numeric(gsub("age: ", "", meta[match(el, meta$name),"X.Sample_characteristics_ch1.3"]))
+  x[["Gender"]] = as.numeric(gsub("gender: ", "", meta[match(el, meta$name),"X.Sample_characteristics_ch1.3"]))
+  
+  #assign(el, x) 
+  scRNA.assays[[el]] = x   
+}
+save(scRNA.assays, file = "scRNA.assays.Rdata")
+```
+
+```{r}
+load(file = "scRNA.assays.Rdata")
+scRNA.assays
+
+scRNA.assays = lapply(scRNA.assays, function(mscRNA){
+  mscRNA <- subset(mscRNA, subset = Doublet == "no" & percent.mt < 10 & nFeature_RNA > 400)
+  return(mscRNA)
+})
+
+scRNA.assays=scRNA.assays[sapply(scRNA.assays, function(x){dim(x@assays$RNA@meta.features)[1]})>10000]
+scRNA.assays=scRNA.assays[sapply(scRNA.assays, function(x){length(x$orig.ident)})>200]
+print("***")
+scRNA.assays
+```
+
+```{r}
+ig = c("ACTA2", "APOLD1", "CD24", "PTPRC", "CLU", "MBP", "GPR17", "SNAP25")
+for (i in 1:length(scRNA.assays)) {
+  scRNA.assays[[i]] <- NormalizeData(scRNA.assays[[i]])
+  scRNA.assays[[i]] <- FindVariableFeatures(scRNA.assays[[i]], selection.method = "vst", nfeatures = 3000)
+  scRNA.assays[[i]] <- ScaleData(scRNA.assays[[i]], features = unique(c(ig, VariableFeatures(scRNA.assays[[i]]))))
+  
+  print(i)
+}
+
+library(URD)
+D = list()
+#p = list()
+dim = 50
+for (i in 1:length(scRNA.assays)) {
+  scRNA.assays[[i]] <- RunPCA(scRNA.assays[[i]], verbose = FALSE, npcs = dim, features = VariableFeatures(scRNA.assays[[i]]))
+  
+  dims = pcaMarchenkoPastur(M = length(VariableFeatures(scRNA.assays[[i]])), N = dim(scRNA.assays[[i]])[2], pca.sdev = scRNA.assays[[i]]@reductions$pca@stdev, factor = 1)
+  dims = (1:dim)[dims]
+  
+  scRNA.assays[[i]] <- RunUMAP(scRNA.assays[[i]], dims = dims, verbose = FALSE)
+  
+  scRNA.assays[[i]] <- FindNeighbors(scRNA.assays[[i]], dims = dims, verbose = FALSE)
+  scRNA.assays[[i]] <- FindClusters(scRNA.assays[[i]], verbose = FALSE)
+  
+  D[[i]] = dims
+  #p[[i]] = DimPlot(scRNA.assays[[i]], label = TRUE) + NoLegend()
+}
+
+gexp = function(scRNA = scRNA, gene, reduction = "UMAP"){
+  df = data.frame(scale = scRNA@assays$RNA@scale.data[gene,rownames(scRNA[[]])],
+                  counts = scRNA@assays$RNA@counts[gene,rownames(scRNA[[]])],
+                  x = scRNA@reductions[[tolower(reduction)]]@cell.embeddings[rownames(scRNA[[]]),1],
+                  y = scRNA@reductions[[tolower(reduction)]]@cell.embeddings[rownames(scRNA[[]]),2])
+  
+  df$value = df$scale
+  df$value = df$value + 0.01 - min(df$value[df$counts>0])
+  df$value[df$counts==0] = 0
+  p = ggplot(df, aes(x = x, y = y, color = value))+
+    geom_point() + labs(title = gene, x = paste(reduction, 1, sep = "_"), y = paste(reduction, 2, sep = "_")) +
+    scale_color_gradientn(name = "Scaled\nexpression\nlevel",
+                          values = c(0, quantile(df$value[df$value>0]))/max(df$value),
+                          colors = alpha(c("gray", rev(hcl.colors(5, "RdYlBu"))),0.5))+
+    theme_classic()
+  return(p)
+}
+
+
+for(EL in names(scRNA.assays)){
+  x = list()
+  x[["clust"]] = DimPlot(scRNA.assays[[EL]], label = TRUE) + NoLegend()
+  for(el in ig){
+    if(el %in% rownames(scRNA.assays[[EL]])){
+      x[[el]] = gexp(scRNA = scRNA.assays[[EL]], gene = el, reduction = "UMAP")
+    }
+  }
+  assign(EL, x)
+}
+```
+
+```{r}
+GSM4119536
+```
+
+
+```{r}
+
+scRNA <- FindIntegrationAnchors(scRNA.assays, dims = 1:30, verbose = T, reference = which(names(scRNA.assays) == "GSM4119536"))
+rm(list = c("scRNA.assays"))
+scRNA <- IntegrateData(anchorset = scRNA, verbose = T, features.to.integrate = unique(c(scRNA@anchor.features, ig)))
+
+save(scRNA, file = "integrated_2504.Rdata")
+```
+
+```{r}
+scRNA <- CellCycleScoring(scRNA, s.features = cc.genes.updated.2019$s.genes, g2m.features = cc.genes.updated.2019$g2m.genes, set.ident = F)
+
+scRNA <- ScaleData(scRNA,  vars.to.regress = c("percent.mt", "S.Score", "G2M.Score"), verbose = T, features = rownames(scRNA@assays$integrated@data))
+```
+
+```{r}
+dim = 100
+scRNA = RunPCA(scRNA, npcs = dim, features = VariableFeatures(scRNA)) 
+#rm(list = ls()[!ls() %in% c("dims", "dim" ,"dropNA", "flip", "ig", "markers", "res", "wd", "scRNA", "m")])
+
+x = pcaMarchenkoPastur(M = length(VariableFeatures(scRNA)), N = dim(scRNA)[2], pca.sdev = scRNA@reductions$pca@stdev, factor = 1)
+sum(!x)
+dims = (1:dim)[x]
+
+scRNA <- RunUMAP(scRNA, dims = dims, reduction = "pca")
+#scRNA <- RunTSNE(scRNA, dims = dims)
+```
+
+```{r}
+gexp = function(scRNA = scRNA, gene, reduction = "UMAP"){
+  df = data.frame(scale = scRNA@assays$integrated@scale.data[gene,rownames(scRNA[[]])],
+                  counts = scRNA@assays$RNA@counts[gene,rownames(scRNA[[]])],
+                  x = scRNA@reductions[[tolower(reduction)]]@cell.embeddings[rownames(scRNA[[]]),1],
+                  y = scRNA@reductions[[tolower(reduction)]]@cell.embeddings[rownames(scRNA[[]]),2])
+  
+  df$value = df$scale
+  df$value = df$value + 0.01 - min(df$value[df$counts>0])
+  df$value[df$counts==0] = 0
+  p = ggplot(df, aes(x = x, y = y, color = value))+
+    geom_point() + labs(title = gene, x = paste(reduction, 1, sep = "_"), y = paste(reduction, 2, sep = "_")) +
+    scale_color_gradientn(name = "Scaled\nexpression\nlevel",
+                          values = c(0, quantile(df$value[df$value>0]))/max(df$value),
+                          colors = alpha(c("gray", rev(hcl.colors(5, "RdYlBu"))),0.5))+
+    theme_classic()
+  return(p)
+}
+```
+
+
+
+
+```{r}
+gexp(scRNA = scRNA, gene = "PTPRC", reduction = "UMAP")
+gexp(scRNA = scRNA, gene = "MBP", reduction = "UMAP")
+gexp(scRNA = scRNA, gene = "CLU", reduction = "UMAP")
+#gexp(scRNA = scRNA, gene = "ACTA2", reduction = "UMAP")
+gexp(scRNA = scRNA, gene = "APOLD1", reduction = "UMAP")
+gexp(scRNA = scRNA, gene = "SNAP25", reduction = "UMAP")
+#gexp(scRNA = scRNA, gene = "GPR17", reduction = "UMAP")
+#gexp(scRNA = scRNA, gene = "CD24", reduction = "UMAP")
+```
+
+
+
+```{r}
+x = c(,,,)
+meta = data.frame(
+  cell = c("MGH36", "MGH53", "MGH54", "MGH60", "MGH42",	"MGH43",	"MGH44",	"MGH45",	"MGH56",	"MGH57",	"MGH61",	"MGH64",	"MGH103",	"MGH107pos","MGH107neg","102","105","105A","114","115","118","124","125","143", "GSM4119531", "GSM4119532", "GSM4119533" , "GSM4119534", "GSM4119535", "GSM4119536", "GSM4119537", "GSM4119538", "GSM4119539", "BT_S2", "BT_S1", "BT_S4", "BT_S6"), #SF11979 SF11977 SF11956	SF11644	SF11136	SF12017	SF11964	SF11949	SF11612
+
+  experiment = c("GSE70630", "GSE70630", "GSE70630", "GSE70630",  "GSE89567",  "GSE89567",  "GSE89567",  "GSE89567",  "GSE89567",  "GSE89567",  "GSE89567",  "GSE89567",  "GSE89567",  "GSE89567", "GSE89567", "GSE131928", "GSE131928", "GSE131928", "GSE131928", "GSE131928", "GSE131928", "GSE131928", "GSE131928", "GSE131928", "GSE138794", "GSE138794", "GSE138794", "GSE138794", "GSE138794", "GSE138794", "GSE138794", "GSE138794", "GSE138794", "GSE84465", "GSE84465", "GSE84465", "GSE84465"), 
+  IDH = c("mut", "mut", "mut", "mut","mut", "mut", "mut", "mut","mut", "mut", "mut", "mut","mut", "mut", "mut","wt", "wt", "wt", "wt", "wt", "wt", "wt", "wt", "wt","wt","wt","wt","wt","mut","mut","mut","mut","mut", "wt", "wt", "wt", "wt"),
+  histology = c("oligodendroglioma","oligodendroglioma","oligodendroglioma","oligodendroglioma","astrocytoma","astrocytoma","astrocytoma","GBM","astrocytoma","GBM","astrocytoma","astrocytoma","astrocytoma","astrocytoma","astrocytoma","GBM","GBM","GBM","GBM","GBM","GBM","GBM","GBM","GBM","GBM",	"GBM",	"GBM",	"GBM",	"astrocytoma",	"astrocytoma",	"GBM",	"oligodendroglioma",	"oligodendroglioma", "GBM", "GBM", "GBM", "GBM"),
+  grade = c(2,2,2,2,3,3,3,4,3,4,3,3,3,2,2,4,4,4,4,4,4,4,4,4,4,4,4,4,2,2,4,3,NA, 4, 4, 4, 4),
+  recurrent = c("no","no","no","no","no", "yes","no","yes","no","no","no","no","no","no","no",NA,NA,NA,NA,NA,NA,NA,NA,NA,"no","no","no","no","no","no", "no","no","yes", "no", "no", "no", "no"),
+  age = c(NA,NA,NA,NA,47,45,32,32,31,42,24,40,26,47,47,NA,NA,NA,NA,NA,NA,NA,NA,NA,76,	61,	63,	57,	34,	44,	64,	40,	67, 54, 55, 60, 48),
+  gender = c(NA,NA,NA,NA, "female",	"male",	"male",	"female",	"male",	"male",	"male",	"female",	"female",	"female","female",NA,NA,NA,NA,NA,NA,NA,NA,NA,"female",	"female","male","male","male","male","male","male","male", NA, NA, NA, NA)
+)
+
+meta
+```
+
+```{r}
+for (i in 1:length(scRNA.assays)) {
+  scRNA.assays[[i]] <- CellCycleScoring(scRNA.assays[[i]], s.features = cc.genes.updated.2019$s.genes, g2m.features = cc.genes.updated.2019$g2m.genes, set.ident = F)
+  scRNA.assays[[i]] <- SCTransform(scRNA.assays[[i]], verbose = T, return.only.var.genes = F) #, vars.to.regress = c("percent.mt", "S.Score", "G2M.Score")
+  print(i)
+}
+save(scRNA.assays, file = "scRNA.assays_SCT.RData")
+```
+
+```{r}
+library(URD)
+
+D = list()
+p = list()
+dim = 150
+for (i in 1:length(scRNA.assays)) {
+  scRNA.assays[[i]] <- RunPCA(scRNA.assays[[i]], verbose = FALSE, npcs = dim)
+  
+  dims = pcaMarchenkoPastur(M = length(VariableFeatures(scRNA.assays[[i]])), N = dim(scRNA.assays[[i]])[2], pca.sdev = scRNA.assays[[i]]@reductions$pca@stdev, factor = 1)
+  dims = (1:dim)[dims]
+  
+  scRNA.assays[[i]] <- RunUMAP(scRNA.assays[[i]], dims = dims, verbose = FALSE)
+  
+  scRNA.assays[[i]] <- FindNeighbors(scRNA.assays[[i]], dims = dims, verbose = FALSE)
+  scRNA.assays[[i]] <- FindClusters(scRNA.assays[[i]], verbose = FALSE)
+  
+  D[[i]] = dims
+  p[[i]] = DimPlot(scRNA.assays[[i]], label = TRUE) + NoLegend()
+}
+
+p
+```
+
+```{r}
+gexp = function(scRNA = scRNA, gene, reduction = "UMAP"){
+  
+  if(sum(rownames(scRNA) == gene)>0){
+  
+    df = data.frame(scale = scRNA@assays$SCT@scale.data[gene,rownames(scRNA[[]])],
+                    counts = scRNA@assays$RNA@counts[gene,rownames(scRNA[[]])],
+                    x = scRNA@reductions[[tolower(reduction)]]@cell.embeddings[rownames(scRNA[[]]),1],
+                    y = scRNA@reductions[[tolower(reduction)]]@cell.embeddings[rownames(scRNA[[]]),2])
+    
+    df$value = df$scale
+    df$value = df$value + 0.01 - min(df$value[df$counts>0])
+    df$value[df$counts==0] = 0
+    p = ggplot(df, aes(x = x, y = y, color = value))+
+      geom_point() + labs(title = gene, x = paste(reduction, 1, sep = "_"), y = paste(reduction, 2, sep = "_")) +
+      scale_color_gradientn(name = "Scaled\nexpression\nlevel",
+                            values = c(0, quantile(df$value[df$value>0]))/max(df$value),
+                            colors = alpha(c("gray", rev(hcl.colors(5, "RdYlBu"))),0.5))+
+      theme_classic()
+    return(p)
+  }
+  else {
+    return("empty")
+  }
+}
+```
+
+
+
+
+
+```{r}
+p = list()
+pCD45 = list()
+pMBP = list()
+pCLU = list()
+pAPOLD1 = list()
+pSNAP25 = list()
+pGPR17 = list()
+pCD24 = list()
+for (i in 1:length(scRNA.assays)) {
+  p[[i]] = DimPlot(scRNA.assays[[i]], label = TRUE) + NoLegend()
+  pCD45[[i]] = gexp(scRNA = scRNA.assays[[i]], gene = "PTPRC", reduction = "UMAP")
+  pMBP[[i]] = gexp(scRNA = scRNA.assays[[i]], gene = "MBP", reduction = "UMAP")
+  pCLU[[i]] = gexp(scRNA = scRNA.assays[[i]], gene = "CLU", reduction = "UMAP")
+  pAPOLD1[[i]] = gexp(scRNA = scRNA.assays[[i]], gene = "APOLD1", reduction = "UMAP")
+  pSNAP25[[i]] = gexp(scRNA = scRNA.assays[[i]], gene = "SNAP25", reduction = "UMAP")
+  pGPR17[[i]] = gexp(scRNA = scRNA.assays[[i]], gene = "GPR17", reduction = "UMAP")
+  pCD24[[i]] = gexp(scRNA = scRNA.assays[[i]], gene = "CD24", reduction = "UMAP")
+}
+p
+```
+
+```{r}
+p
+```
+
+
+```{r}
+pCLU
+```
+```{r}
+scRNA.assays$GSM4119536$prim_ident = ifelse(scRNA.assays$GSM4119536$SCT_snn_res.0.8 %in% c("3"), "oligodendroglia", ifelse(scRNA.assays$GSM4119536$SCT_snn_res.0.8 %in% c("2", "4"), "immune", ifelse(scRNA.assays$GSM4119536$SCT_snn_res.0.8 %in% c("7"), "vascular", ifelse(scRNA.assays$GSM4119536$SCT_snn_res.0.8 %in% c("1"), "astrocyte", "glioma"))))
+
+DimPlot(scRNA.assays$GSM4119536, group.by = "prim_ident")
+```
+
+
+```{r}
+scRNA.assays$GSM4119535$prim_ident = ifelse(scRNA.assays$GSM4119535$SCT_snn_res.0.8 %in% c("6"), "vascular", ifelse(scRNA.assays$GSM4119535$SCT_snn_res.0.8 %in% c("5"), "immune", ifelse(scRNA.assays$GSM4119535$SCT_snn_res.0.8 %in% c("3"), "astrocyte", ifelse(scRNA.assays$GSM4119535$SCT_snn_res.0.8 %in% c("0","1","4"), "oligodendroglia", ifelse(scRNA.assays$GSM4119535$SCT_snn_res.0.8 %in% c("7"), "OPC", "glioma")))))
+
+DimPlot(scRNA.assays$GSM4119535, group.by = "prim_ident")
+```
+
+
+```{r}
+scRNA.assays$GSM4119534$prim_ident = ifelse(scRNA.assays$GSM4119534$SCT_snn_res.0.8 %in% c("0", "11", "14"), "immune", ifelse(scRNA.assays$GSM4119534$SCT_snn_res.0.8 %in% c("10", "5"), "astrocyte", ifelse(scRNA.assays$GSM4119534$SCT_snn_res.0.8 %in% c("13"), "oligodendroglia", ifelse(scRNA.assays$GSM4119534$SCT_snn_res.0.8 %in% c("12"), "vascular", "glioma"))))
+
+DimPlot(scRNA.assays$GSM4119534, group.by = "prim_ident")
+```
+
+
+```{r}
+scRNA.assays$GSM4119533$prim_ident = ifelse(scRNA.assays$GSM4119533$SCT_snn_res.0.8 %in% c("5","8"), "immune", ifelse(scRNA.assays$GSM4119533$SCT_snn_res.0.8 %in% c("11"), "oligodendroglia", ifelse(scRNA.assays$GSM4119533$SCT_snn_res.0.8 %in% c("6"), "neuron", ifelse(scRNA.assays$GSM4119533$SCT_snn_res.0.8 %in% c("9"), "vascular", "glioma"))))
+
+DimPlot(scRNA.assays$GSM4119533, group.by = "prim_ident")
+```
+
+
+```{r}
+scRNA.assays$GSM4119531$prim_ident = ifelse(scRNA.assays$GSM4119531$SCT_snn_res.0.8 %in% c("1","7"), "immune", ifelse(scRNA.assays$GSM4119531$SCT_snn_res.0.8 == "9", "oligodendroglia", ifelse(scRNA.assays$GSM4119531$SCT_snn_res.0.8 == "2", "astrocyte", ifelse(scRNA.assays$GSM4119531$SCT_snn_res.0.8 == "8", "OPC", ifelse(scRNA.assays$GSM4119531$SCT_snn_res.0.8 == "5", "neuron", "glioma")))))
+
+DimPlot(scRNA.assays$GSM4119531, group.by = "prim_ident")
+```
+
+
+```{r}
+x = c(,,,)
+DimPlot(scRNA.assays$GSM4119531, group.by = "prim_ident")
+DimPlot(scRNA.assays$GSM4119533, group.by = "prim_ident")
+DimPlot(scRNA.assays$GSM4119534, group.by = "prim_ident")
+DimPlot(scRNA.assays$GSM4119535, group.by = "prim_ident")
+DimPlot(scRNA.assays$GSM4119536, group.by = "prim_ident")
+```
+```{r}
+GSE138794 = scRNA.assays
+save(GSE138794, file = "GSE138794_SCT.Rdata")
+```
+
+
+```{r}
+load(file = "GSE138794_SCT.Rdata")
+```
+
+
+```{r}
+memory.limit(1e6)
+GSE138794
+
+x = SelectIntegrationFeatures(object.list = GSE138794, nfeatures = 3000)
+
+scRNA = PrepSCTIntegration(object.list = GSE138794, anchor.features = x, verbose = T)
+
+rm(list = ls()[!(ls() %in% c("f", "flip", "dropNA", "scRNA", "x"))])
+
+scRNA<- FindIntegrationAnchors(object.list = scRNA, normalization.method = "SCT", anchor.features = x, verbose = T)
+scRNA <- IntegrateData(anchorset = scRNA, normalization.method = "SCT", verbose = T)
+save(scRNA, file = "integrated_SCT.Rdata")
+```
+
+```{r}
+library(URD)
+dim = 100
+scRNA <- RunPCA(scRNA, verbose = FALSE, npcs = dim)
+dims = pcaMarchenkoPastur(M = length(VariableFeatures(scRNA)), N = dim(scRNA)[2], pca.sdev = scRNA@reductions$pca@stdev, factor = 1)
+dims = (1:dim)[dims]
+```
+```{r}
+scRNA <- RunUMAP(scRNA, dims = dims)
+#scRNA <- RunTSNE(scRNA, dims = dims)
+```
+
+```{r}
+el= "prim_ident"
+DimPlot(scRNA,group.by = el, pt.size = 1, reduction = "umap", label = T) + scale_color_manual(values = alpha(rainbow(length(unique(dropNA(scRNA[[]][,el])))), 0.3), na.value = "gray")
+```
+
+```{r}
+scRNA <- FindNeighbors(scRNA, dims = dims)
+for(el in 0.1 + 0:15/10){
+  scRNA <- FindClusters(scRNA, resolution = el)
+}
+```
+
+```{r}
+el="integrated_snn_res.1"
+DimPlot(scRNA,group.by = el, pt.size = 1, reduction = "umap", label = T) + scale_color_manual(values = alpha(rainbow(length(unique(dropNA(scRNA[[]][,el])))), 0.5), na.value = "gray")
+```
+
+```{r}
+DefaultAssay(scRNA) = "RNA"
+FeaturePlot(scRNA, features = "PTPRC")
+DefaultAssay(scRNA) = "integrated"
+```
+
+```{r}
+x = c(,,,)
+scRNA.ds = as.character(meta[grepl("scRNA-Seq", meta$X.Sample_title),"name"])
+scRNA.ds
+```
+
+
+
+
+```{r}
+MoMa = scRNA.assays
+MoMa = lapply(MoMa, function(mscRNA){
+  mscRNA[["Mo_Ma"]] = ifelse(mscRNA$singleR=="Monocytes"|mscRNA$singleR=="Macrophages", "yes", "no")
+  mscRNA = subset(mscRNA, subset = Mo_Ma == "yes")
+  return(mscRNA)
+})
+save(MoMa, file = "MoMa_GSE138794.Rdata")
+```
+
+
+```{r}
+load("scRNA.assays.Rdata")
+scRNA.assays
+
+scRNA.assays = lapply(scRNA.assays, function(mscRNA){
+  mscRNA <- subset(mscRNA, subset = Doublet == "no" & percent.mt < 10 & nFeature_RNA > 400)
+  return(mscRNA)
+})
+
+scRNA.assays=scRNA.assays[sapply(scRNA.assays, function(x){dim(x@assays$RNA@meta.features)[1]})>10000]
+scRNA.assays=scRNA.assays[sapply(scRNA.assays, function(x){length(x$orig.ident)})>200]
+print("***")
+scRNA.assays
+
+```
+
+
+```{r}
+for (i in 1:length(scRNA.assays)) {
+  #DefaultAssay(scRNA.assays[[i]]) = "RNA"
+  scRNA.assays[[i]] <- NormalizeData(scRNA.assays[[i]], verbose = FALSE)
+  scRNA.assays[[i]] <- FindVariableFeatures(scRNA.assays[[i]], selection.method = "vst", nfeatures = 2000, verbose = FALSE)
+}
+save(scRNA.assays, file = "scRNAassays3.Rdata")
+
+memory.limit(25*16257)
+options(future.globals.maxSize = 8*500*1024^2)
+scRNA <- FindIntegrationAnchors(object.list = scRNA.assays, dims = 1:30)
+
+#save(scRNA, file="anchors.Rdata")
+
+scRNA <- IntegrateData(anchorset = scRNA, dims = 1:30)
+save(scRNA, file = "scRNAintegrated1.Rdata")
+
+#load("scRNAintegrated1.Rdata")
+dim = 100
+scRNA <- ScaleData(scRNA)
+scRNA <- FindVariableFeatures(scRNA)
+scRNA <- RunPCA(scRNA, features = VariableFeatures(object = scRNA), npcs = dim)
+scRNA <- RunUMAP(scRNA, dims = 1:10)
+scRNA <- RunTSNE(scRNA, dims = 1:10)
+
+#setwd(paste(wd, "//merge", sep = ""))
+#scRNA <- RunPCA(scRNA, features = VariableFeatures(object = scRNA), npcs = dim)
+scRNA <- JackStraw(scRNA, dims = dim, num.replicate = 100)
+
+scRNA <- ScoreJackStraw(scRNA, dims = 1:dim, score.thresh = 1e-10, do.plot = F)
+
+p = JackStrawPlot(scRNA, dims = 1:dim) + scale_color_manual(values = rainbow(dim)[rep(dim*c(0, 0.2, 0.4, 0.6, 0.8), times = 20)+ unlist(lapply(1:(dim/5), rep, times = 5))])
+p
+
+ggsave("GSE138794 JackStrawPlot 100.png", p, width = 32, height = 6, dpi = 400)
+ggsave("GSE138794 JackStrawPlot 100.pdf", p, width = 32, height = 6, dpi = 400)
+
+dims = (1:dim)[as.numeric(sapply(strsplit(as.character(unique(ggplot_build(p)$plot$data$PC.Score)), ": "), function(X){return(X[2])}))<0.05]
+
+scRNA <- RunUMAP(scRNA, dims = dims)
+scRNA <- RunTSNE(scRNA, dims = dims)
+
+library(ggplot2)
+ggsave(plot = DimPlot(scRNA, reduction = "umap", label = F),
+       filename = "Samples after integration.pdf",
+       width = 8, height = 6, dpi = 400)
+
+ggsave(plot = DimPlot(scRNA, reduction = "umap", label = F),
+       filename = "Samples after integration.png",
+       width = 8, height = 6, dpi = 400)
+
+scRNA <- FindNeighbors(scRNA, dims = dims)
+for(el in 0.1 + 0:14/10){
+  scRNA <- FindClusters(scRNA, resolution = el)
+  'if(sum(grepl(paste("integrated_snn_res.", el, sep = ""), colnames(scRNA[[]])))==0){
+    scRNA <- FindClusters(scRNA, resolution = el)
+  }'
+}
+
+save(scRNA, file = "GSE138794_scRNA_clusters.Rdata")
+
+library(clustree)
+
+p = clustree(scRNA, prefix = "integrated_snn_res.")
+
+ggsave(plot = p, filename = paste("Clustree.png",sep = ""), width = 10, height = 8, dpi = 400)
+ggsave(plot = p, filename = paste("Clustree.pdf",sep = ""), width = 10, height = 8, dpi = 400)
+print(dims)
+```
+
+
+```{r}
+load("GSE138794_scRNA_clusters.Rdata")
+
+scRNA <- BuildClusterTree(scRNA)
+
+PlotClusterTree(scRNA)
+```
+
+```{r}
+scRNA <- AddModuleScore(scRNA, features =  list(mdsc = c("S100A8", "S100A9", "CEBPB", "ARG1", "ARG2", "IL1B", "IDO1", "NOS2", "IL4R", "IL10", "TGFB1")), name = "MDSC", ctrl = 75, assay = "RNA")
+```
+
+
+
+```{r}
+p = DimPlot(scRNA, reduction = "umap", label = F, group.by = "singleR", pt.size = 2)
+x = setNames(rep("", length(levels(ggplot_build(p)$plot$data$singleR))), levels(ggplot_build(p)$plot$data$singleR))
+x[!(levels(ggplot_build(p)$plot$data$singleR)=="Monocytes"|levels(ggplot_build(p)$plot$data$singleR)=="Macrophages")] = rainbow(length(levels(ggplot_build(p)$plot$data$singleR))-2)
+x["Macrophages"] = "black"
+x["Monocytes"] = "gray30"
+p = p + scale_color_manual(values=alpha(x, 0.5)) + ggtitle("GSE138794 - singleR")
+
+
+p = grid.arrange(p, FeaturePlot(scRNA, features = "MDSC1", pt.size = 2) + ggtitle("GSE138794 - MDSC score") + scale_color_gradientn(colors = alpha(brewer.pal(n = 6, name = "YlGnBu"),0.5)), ncol = 2)
+
+ggsave(p, filename = "GSE138794 before selection.png", dpi = 400, width = 16, height = 6)
+```
+```{r}
+p = DimPlot(scRNA, reduction = "tsne", label = F, group.by = "singleR", pt.size = 2)
+x = setNames(rep("", length(levels(ggplot_build(p)$plot$data$singleR))), levels(ggplot_build(p)$plot$data$singleR))
+x[!(levels(ggplot_build(p)$plot$data$singleR)=="Monocytes"|levels(ggplot_build(p)$plot$data$singleR)=="Macrophages")] = rainbow(length(levels(ggplot_build(p)$plot$data$singleR))-2)
+x["Macrophages"] = "black"
+x["Monocytes"] = "gray30"
+p = p + scale_color_manual(values=alpha(x, 0.5)) + ggtitle("GSE138794 - singleR")
+
+
+p = grid.arrange(p, FeaturePlot(scRNA, features = "MDSC1", pt.size = 2, reduction = "tsne") + ggtitle("GSE138794 - MDSC score") + scale_color_gradientn(colors = alpha(brewer.pal(n = 6, name = "YlGnBu"),0.5)), ncol = 2)
+
+ggsave(p, filename = "GSE138794 before selection tSNE.png", dpi = 400, width = 16, height = 6)
+```
+
+```{r}
+VlnPlot(scRNA, features = "MDSC1", group.by = "singleR") #"integrated_snn_res.0.1"
+```
+
+```{r}
+x = c(,,,)
+```
+
+
+```{r}
+Idents(scRNA) = scRNA$integrated_snn_res.1
+DimPlot(scRNA, reduction = "umap", label = T)
+```
+
+```{r}
+ct = scRNA@reductions$umap@cell.embeddings
+ct = cbind(ct, scRNA[[]][rownames(ct),grepl("integrated_snn_res",colnames(scRNA[[]]))])
+
+for(el in colnames(ct)[grepl("integrated_snn_res",colnames(ct))]){
+  ct[,el] = as.numeric(as.character(ct[,el]))
+}
+colnames(ct) = gsub("integrated_snn_res.", "K", colnames(ct))
+
+x = as.numeric(gsub("K", "", colnames(ct)))
+x[is.na(x)] = 0
+x = 10*x
+
+ct = ct[,(!grepl("K", colnames(ct)))|(x%%2==1)]
+
+p = clustree_overlay(ct, prefix = "K", x_value = "UMAP_1", y_value = "UMAP_2", label_nodes = T)
+p = p + theme_bw()
+ggsave(p, width = 12, height = 8, dpi = 400, filename = "clustree_UMAP.png")
+```
+
+```{r}
+p = DimPlot(scRNA, reduction = "umap", label = F, group.by = "singleR")
+x = terrain.colors(length(levels(ggplot_build(p)$plot$data$singleR)))
+x[levels(ggplot_build(p)$plot$data$singleR)=="Macrophages"] = "cornflowerblue"
+x[levels(ggplot_build(p)$plot$data$singleR)=="Monocytes"] = "blue4"
+p + scale_color_manual(values=x)
+```
+
+
+
+```{r}
+p = DimPlot(scRNA, reduction = "umap", label = F, group.by = "orig.ident")
+x = rainbow(length(levels(ggplot_build(p)$plot$data$orig.ident)))
+p + scale_color_manual(values=x)
+```
+
+```{r}
+xtabs(~singleR+integrated_snn_res.0.1, data = scRNA[[]])
+```
+
+
+
+```{r}
+Panglao = read.table(file = 'PanglaoDB_markers_23_Dec_2019.tsv', h=T, sep = '\t', quote = '')
+
+Panglao = Panglao[grepl("Hs", Panglao$species),]
+PG = list()
+for(el in unique(Panglao$cell.type)){
+  PG[[el]] = as.character(Panglao[Panglao$cell.type==el,"official.gene.symbol"])
+}
+
+#Idents(scRNA) = scRNA$integrated_snn_res.0.5
+for(el in c("Macrophages", "Microglia","Monocytes", "Myeloid-derived suppressor cells", "Meningeal cells",   "Astrocytes", "B cells", "Neutrophils", "Endothelial cells (blood brain barrier)", "Ependymal cells", "Neurons", "NK cells", "Oligodendrocytes", "T cells", "Neurons", "Vascular smooth muscle cells")){ #names(PG)
+  if(length(intersect(rownames(scRNA), PG[[el]]))>0){ #intersect(rownames(scRNA@assays$RNA@counts), PG[[el]])
+    p = DotPlot(scRNA, features = intersect(rownames(scRNA), PG[[el]]), assay = "integrated")
+    p$guides$colour$title = "Expression level"
+    p = p + labs(title = paste("Panglao", el, "genetic markers"), x = "Gene", y = "Cluster, res = 1.5") + theme(axis.text.x = element_text(angle = 90)) + scale_color_gradientn(colours = c("blue4", "blue", "red", "yellow"),values = c(0,0.5,0.8, 1))
+    ggsave(filename = paste("GSE138794 Panglao ", gsub("/", " or ", el), ".png", sep = ""), plot = p, dpi = 400, width = min(50,(10 + 0.6*length(intersect(rownames(scRNA), PG[[el]])))), height = 20, units = "cm")
+  }
+}
+
+library(xlsx)
+markers = read.xlsx(file = "Gene_markers.xlsx", sheetName = "Sheet1")
+markers$gene = toupper(markers$gene)
+
+el = as.character(markers$group)
+el = sapply(el, function(x){
+  paste(toupper(substr(x,1,1)), substr(x,2,nchar(x)), sep = "")
+})
+
+el = sapply(el, function(x){
+  if(nchar(x)>25){
+    x = paste(substr(x, 1, which(strsplit(x, "")[[1]]==" ")[which.min(abs((2*which(strsplit(x, "")[[1]]==" ")/nchar(x))-1))]-1),substr(x, which(strsplit(x, "")[[1]]==" ")[which.min(abs((2*which(strsplit(x, "")[[1]]==" ")/nchar(x))-1))]+1, nchar(x)), sep = "\n")
+  }
+  return(x)
+})
+markers$group = as.factor(el)
+
+p = DotPlot(scRNA, features = unique(as.character(markers$gene)), assay = "RNA") + RotatedAxis()
+p$data$group = as.character(markers$group)[match(as.character(p$data$features.plot), as.character(markers$gene))]
+
+p$data$group = factor(p$data$group, order = F)
+
+for(el in rev(unique(as.character(markers$group)))){
+  if(sum(p$data$group==el)>0){
+    p$data$group = relevel(p$data$group, ref = el)
+  }
+}
+
+p = p + facet_grid(. ~ group, drop = T, scales = "free_x", space = "free_x") +theme(strip.text.x = element_text(angle=90))
+ggsave(p, filename = "markers.pdf", width = 20, height = 10)
+ggsave(p, filename = "markers.pdf", width = 20, height = 10)
+```
+
+```{r}
+for(el in intersect(PG$`Myeloid-derived suppressor cells`, rownames(scRNA)) ){ #"FOS", 
+  pg = clustree(scRNA, prefix = "integrated_snn_res.", node_colour = el, node_colour_aggr = "median") + scale_color_gradientn(colours = c("blue4", "red", "yellow"),values = c(0,0.5,1))
+  ggsave(plot = pg, filename = paste("clustree PG MDSC ", el, ".png", sep = ""), width = 10, height = 8, dpi = 400)
+  ggsave(plot = pg, filename = paste("clustree PG MDSC ", el, ".png", sep = ""), width = 10, height = 8, dpi = 400)
+}
+```
+
+```{r}
+for(el in intersect(markers$gene[markers$group=="Microglia"], rownames(scRNA))){  #intersect(PG$Microglia, rownames(scRNA))
+  pg = clustree(scRNA, prefix = "integrated_snn_res.", node_colour = el, node_colour_aggr = "median") + scale_color_gradientn(colours = c("blue4", "red", "yellow"),values = c(0,0.5,1))
+  ggsave(plot = pg, filename = paste("clustree Microglia ", el, ".png", sep = ""), width = 10, height = 8, dpi = 400)
+  ggsave(plot = pg, filename = paste("clustree Microglia ", el, ".png", sep = ""), width = 10, height = 8, dpi = 400)
+}
+```
+
+```{r}
+for(el in rev(intersect(PG$Monocytes, rownames(scRNA))[!(grepl("-", intersect(PG$Monocytes, rownames(scRNA))))])){ #"FOS", 
+  pg = clustree(scRNA, prefix = "integrated_snn_res.", node_colour = el, node_colour_aggr = "median") + scale_color_gradientn(colours = c("blue4", "red", "yellow"),values = c(0,0.5,1))
+  ggsave(plot = pg, filename = gsub("-", "_", paste("clustree PG Monocytes ", el, ".png", sep = "")), width = 10, height = 8, dpi = 400)
+  ggsave(plot = pg, filename = gsub("-", "_", paste("clustree PG Monocytes ", el, ".png", sep = "")), width = 10, height = 8, dpi = 400)
+}
+```
+
+```{r}
+rev(intersect(PG$Monocytes, rownames(scRNA))[!(grepl("-", intersect(PG$Monocytes, rownames(scRNA))))])
+```
+
+
+```{r}
+for(el in rev(intersect(PG$Macrophages, rownames(scRNA))[!(grepl("-", intersect(PG$Macrophages, rownames(scRNA))))]) ){ #"FOS", 
+  pg = clustree(scRNA, prefix = "integrated_snn_res.", node_colour = el, node_colour_aggr = "median") + scale_color_gradientn(colours = c("blue4", "red", "yellow"),values = c(0,0.5,1))
+  ggsave(plot = pg, filename = paste("clustree PG Macrophages ", el, ".png", sep = ""), width = 10, height = 8, dpi = 400)
+  ggsave(plot = pg, filename = paste("clustree PG Macrophages ", el, ".png", sep = ""), width = 10, height = 8, dpi = 400)
+}
+```
+
+```{r}
+x = c(,,,)
+```
+
+
+```{r}
+load("GSE138794_scRNA_clusters.Rdata")
+
+DimPlot(scRNA, reduction = "umap", label = T)
+scRNA[["sel"]] = ifelse(scRNA[[]]$integrated_snn_res.0.1==2, "yes", "no")
+#scRNA[["sel"]] = ifelse(scRNA[[]]$singleR=="Macrophages"|scRNA[[]]$singleR=="Monocytes", "yes", "no")
+table(scRNA[[]][scRNA[[]]$sel=="yes","singleR"])
+
+wd = getwd()
+setwd(paste(wd, "//MoMa", sep = ""))
+scRNA = subset(scRNA, subset = sel == "yes")
+save(scRNA, file = "scRNA1.Rdata")
+
+Idents(scRNA) = scRNA$integrated_snn_res.1
+```
+
+```{r}
+wd = getwd()
+setwd(paste(wd, "//MoMa", sep = ""))
+
+
+#load("scRNAintegrated1.Rdata")
+dim = 150
+scRNA <- ScaleData(scRNA)
+scRNA <- FindVariableFeatures(scRNA)
+scRNA <- RunPCA(scRNA, features = VariableFeatures(object = scRNA), npcs = dim)
+scRNA <- RunUMAP(scRNA, dims = 1:10)
+scRNA <- RunTSNE(scRNA, dims = 1:10)
+
+#setwd(paste(wd, "//merge", sep = ""))
+#scRNA <- RunPCA(scRNA, features = VariableFeatures(object = scRNA), npcs = dim)
+scRNA <- JackStraw(scRNA, dims = dim, num.replicate = 150)
+
+scRNA <- ScoreJackStraw(scRNA, dims = 1:dim, score.thresh = 1e-10, do.plot = F)
+```
+
+
+```{r}
+wd = getwd()
+setwd(paste(wd, "//MoMa", sep = ""))
+dim = 150
+p = JackStrawPlot(scRNA, dims = 1:dim) + scale_color_manual(values = rainbow(dim)[rep(dim*c(0, 0.2, 0.4, 0.6, 0.8), times = 20)+ unlist(lapply(1:(dim/5), rep, times = 5))])
+p
+
+ggsave("GSE138794 JackStrawPlot 100.png", p, width = 32, height = 6, dpi = 400)
+ggsave("GSE138794 JackStrawPlot 100.pdf", p, width = 32, height = 6, dpi = 400)
+
+dims = (1:dim)[as.numeric(sapply(strsplit(as.character(unique(ggplot_build(p)$plot$data$PC.Score)), ": "), function(X){return(X[2])}))<1e-10]
+
+scRNA <- RunUMAP(scRNA, dims = dims)
+scRNA <- RunTSNE(scRNA, dims = dims)
+
+library(ggplot2)
+ggsave(plot = DimPlot(scRNA, reduction = "umap", label = F),
+       filename = "Samples after integration.pdf",
+       width = 8, height = 6, dpi = 400)
+
+ggsave(plot = DimPlot(scRNA, reduction = "umap", label = F),
+       filename = "Samples after integration.png",
+       width = 8, height = 6, dpi = 400)
+
+scRNA <- FindNeighbors(scRNA, dims = dims)
+for(el in 0.1 + 0:14/10){
+  scRNA <- FindClusters(scRNA, resolution = el)
+  'if(sum(grepl(paste("integrated_snn_res.", el, sep = ""), colnames(scRNA[[]])))==0){
+    scRNA <- FindClusters(scRNA, resolution = el)
+  }'
+}
+
+save(scRNA, file = "GSE138794_scRNA_clusters.Rdata")
+
+library(clustree)
+
+p = clustree(scRNA, prefix = "integrated_snn_res.")
+
+ggsave(plot = p, filename = paste("Clustree.png",sep = ""), width = 10, height = 8, dpi = 400)
+ggsave(plot = p, filename = paste("Clustree.pdf",sep = ""), width = 10, height = 8, dpi = 400)
+```
+
+
+```{r}
+dims
+```
+
+
+```{r}
+setwd(paste(wd, "//MoMa", sep = ""))
+
+library(ggplot2)
+ggsave(plot = DimPlot(scRNA, reduction = "umap", label = F),
+       filename = "Samples MoMA.pdf",
+       width = 8, height = 6, dpi = 400)
+
+ggsave(plot = DimPlot(scRNA, reduction = "umap", label = F),
+       filename = "Samples MoMa.png",
+       width = 8, height = 6, dpi = 400)
+```
+
+
+```{r}
+scRNA <- BuildClusterTree(scRNA)
+
+PlotClusterTree(scRNA)
+```
+
+```{r}
+Idents(scRNA) = scRNA$integrated_snn_res.0.7
+DimPlot(scRNA, reduction = "umap", label = T)
+```
+
+
+
+
+
+
+
+```{r}
+wd = getwd()
+setwd(paste(getwd(), "//MoMa", sep = ""))
+load(file = "GSE138794_scRNA_clusters.Rdata")
+scRNA@assays$RNA@counts[1:10,1:10]
+```
+
+
+```{r}
+Idents(scRNA) = scRNA$integrated_snn_res.0.7
+
+x = sapply(levels(Idents(scRNA)), function(el){
+  mean(scRNA@assays$RNA@counts["TMEM119",rownames(scRNA[[]][Idents(scRNA)==el,])])
+})
+
+x = x[order(x)]
+
+#X = factor(paste("C", Idents(scRNA), sep = ""))
+X = Idents(scRNA)
+
+for(el in names(x)){
+  X = relevel(X, el)
+}
+
+library(plyr)
+X = mapvalues(X, to = 0:max(as.numeric(as.character(levels(X)))), from = levels(X))
+
+Idents(scRNA) = X
+
+DimPlot(scRNA, reduction = "umap", label = T)
+
+scRNA.markers = FindAllMarkers(scRNA)
+```
+
+```{r}
+Panglao = read.table(file = "PanglaoDB_markers_23_Dec_2019.tsv", h=T, sep = '\t', quote = '')
+
+Panglao = Panglao[grepl("Hs", Panglao$species),]
+PG = list()
+for(el in unique(Panglao$cell.type)){
+  PG[[el]] = as.character(Panglao[Panglao$cell.type==el,"official.gene.symbol"])
+}
+library(xlsx)
+markers = read.xlsx(file = "Gene_markers.xlsx", sheetName = "Sheet1")
+markers$gene = toupper(markers$gene)
+markers = markers[markers$ofi=="yes",]
+el = as.character(markers$group)
+el = sapply(el, function(x){
+  paste(toupper(substr(x,1,1)), substr(x,2,nchar(x)), sep = "")
+})
+
+el = sapply(el, function(x){
+  if(nchar(x)>25){
+    x = paste(substr(x, 1, which(strsplit(x, "")[[1]]==" ")[which.min(abs((2*which(strsplit(x, "")[[1]]==" ")/nchar(x))-1))]-1),substr(x, which(strsplit(x, "")[[1]]==" ")[which.min(abs((2*which(strsplit(x, "")[[1]]==" ")/nchar(x))-1))]+1, nchar(x)), sep = "\n")
+  }
+  return(x)
+})
+markers$group = as.factor(el)
+
+
+wd = getwd()
+setwd(paste(wd, "//MoMa", sep = ""))
+
+
+p = DotPlot(scRNA, features = unique(as.character(markers$gene)), assay = "RNA", cols = "RdYlBu")
+p = p + RotatedAxis() + guides(color = guide_colorbar(title = 'Average\nExpression Level'))
+p$data$group = as.character(markers$group)[match(as.character(p$data$features.plot), as.character(markers$gene))]
+
+p$data$group = factor(p$data$group, order = F)
+
+for(el in rev(unique(as.character(markers$group)))){
+  if(sum(p$data$group==el)>0){
+    p$data$group = relevel(p$data$group, ref = el)
+  }
+}
+
+p = p + facet_grid(. ~ group, drop = T, scales = "free_x", space = "free_x") +theme(strip.text.x = element_text(angle=90))
+x = length(unique(ggplot_build(p)$plot$data$features.plot))/5
+p1 = DimPlot(scRNA, reduction = "umap", label = T, cols = "Set2") + ggtitle("Macrophages - assigned clusters")
+
+p = grid.arrange(p1,p, nrow = 1, widths = c(9, 3+x))
+
+ggsave(p, filename = "markers.pdf", width = 12+x, height = 7)
+ggsave(p, filename = "markers.png", width = 12+x, height = 7)
+ggsave(p, filename = "GSE138794.png", width = 12+x, height = 7)
+
+panglao = PG
+panglao = panglao[c("Myeloid-derived suppressor cells", "Macrophages", "Monocytes", "Microglia", "Neutrophils")]
+panglao = sapply(panglao, function(x){x = intersect(x, rownames(scRNA))})
+panglao = data.frame(gene = unlist(panglao), group = rep(names(panglao), times = sapply(panglao, length)))
+p = DotPlot(scRNA, features = unique(as.character(panglao$gene)), assay = "RNA", cols = "RdYlBu")
+p = p + RotatedAxis()  + guides(color = guide_colorbar(title = 'Average\nExpression Level'))
+p$data$group = as.character(panglao$group)[match(as.character(p$data$features.plot), as.character(panglao$gene))]
+
+p$data$group = factor(p$data$group, order = F)
+
+for(el in rev(unique(as.character(panglao$group)))){
+  if(sum(p$data$group==el)>0){
+    p$data$group = relevel(p$data$group, ref = el)
+  }
+}
+
+p = p + facet_grid(. ~ group, drop = T, scales = "free_x", space = "free_x") +theme(strip.text.x = element_text(angle=90))
+p1 = DimPlot(scRNA, reduction = "umap", label = T, cols = "Set2") + ggtitle("Macrophages - assigned clusters")
+
+p = grid.arrange(p1,p, nrow = 1,  widths = c(9, 3+x))
+
+ggsave(p, filename = "panglao.pdf", width = 12+x, height = 7)
+ggsave(p, filename = "panglao.png", width = 12+x, height = 7)
+```
+
+```{r}
+
+x = scRNA[[]]
+save(x, file = "GSE138794_clusters.Rdata")
+```
+
+
+```{r}
+ct = scRNA@reductions$umap@cell.embeddings
+ct = cbind(ct, scRNA[[]][rownames(ct),grepl("integrated_snn_res",colnames(scRNA[[]]))])
+
+for(el in colnames(ct)[grepl("integrated_snn_res",colnames(ct))]){
+  ct[,el] = as.numeric(as.character(ct[,el]))
+}
+colnames(ct) = gsub("integrated_snn_res.", "K", colnames(ct))
+
+x = as.numeric(gsub("K", "", colnames(ct)))
+x[is.na(x)] = 0
+x = 10*x
+
+ct = ct[,(!grepl("K", colnames(ct)))|(x%%2==1)]
+
+p = clustree_overlay(ct, prefix = "K", x_value = "UMAP_1", y_value = "UMAP_2", label_nodes = T)
+p = p + theme_bw()
+setwd(paste(wd, "//MoMa", sep = ""))
+ggsave(p, width = 12, height = 8, dpi = 400, filename = "clustree_UMAP.png")
+```
+
+
+
+
+```{r}
+setwd(paste(wd, "//MoMa", sep = ""))
+library(gridExtra)
+for(el in unique(intersect(c(PG$Microglia, PG$`Myeloid-derived suppressor cells`, PG$Macrophages, PG$Monocytes), (scRNA.markers[scRNA.markers$p_val_adj<0.05,"gene"])))){
+  p1 = FeaturePlot(scRNA, features = el) + scale_color_gradientn(colours = c("gray", "blue", "green", "yellow"),values = c(0,0.3,0.6, 1))
+  p = FeaturePlot(scRNA, features = el, slot = "counts") 
+    p = p + scale_color_gradientn(colours = c("gray", "cornflowerblue", "blue4", "red4", "red"),values = (c(min(ggplot_build(p)$plot$data[,4]),
+    min(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]),
+    median(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]),
+    mean(ggplot_build(p)$plot$data[,4][ggplot_build(p)$plot$data[,4]>(median(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))]),
+    max(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))-min(ggplot_build(p)$plot$data[,4]))/max(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))
+  ggsave(grid.arrange(p1, p, ncol=2), filename = paste("PG_Marker_", el, ".png", sep = ""), dpi=400, width = 15, height = 7)
+}
+```
+
+
+
+```{r}
+setwd(paste(wd, "//MoMa", sep = ""))
+
+for(el in intersect(PG$`Myeloid-derived suppressor cells`, rownames(scRNA)) ){ #"FOS", 
+  pg = clustree(scRNA, prefix = "integrated_snn_res.", node_colour = el, node_colour_aggr = "median") + scale_color_gradientn(colours = c("blue4", "red", "yellow"),values = c(0,0.5,1))
+  ggsave(plot = pg, filename = paste("clustree PG MDSC ", el, ".png", sep = ""), width = 10, height = 8, dpi = 400)
+  ggsave(plot = pg, filename = paste("clustree PG MDSC ", el, ".png", sep = ""), width = 10, height = 8, dpi = 400)
+}
+
+for(el in intersect(markers$gene[markers$group=="Microglia"], rownames(scRNA))){  #intersect(PG$Microglia, rownames(scRNA))
+  pg = clustree(scRNA, prefix = "integrated_snn_res.", node_colour = el, node_colour_aggr = "median") + scale_color_gradientn(colours = c("blue4", "red", "yellow"),values = c(0,0.5,1))
+  ggsave(plot = pg, filename = paste("clustree Microglia ", el, ".png", sep = ""), width = 10, height = 8, dpi = 400)
+  ggsave(plot = pg, filename = paste("clustree Microglia ", el, ".png", sep = ""), width = 10, height = 8, dpi = 400)
+}
+
+for(el in (intersect(PG$Monocytes, rownames(scRNA)))[!(grepl("-", intersect(PG$Monocytes, rownames(scRNA))))] ){ #"FOS", 
+  pg = clustree(scRNA, prefix = "integrated_snn_res.", node_colour = el, node_colour_aggr = "median") + scale_color_gradientn(colours = c("blue4", "red", "yellow"),values = c(0,0.5,1))
+  ggsave(plot = pg, filename = paste("clustree PG Monocytes ", el, ".png", sep = ""), width = 10, height = 8, dpi = 400)
+  ggsave(plot = pg, filename = paste("clustree PG Monocytes ", el, ".png", sep = ""), width = 10, height = 8, dpi = 400)
+}
+
+for(el in rev(intersect(PG$Macrophages, rownames(scRNA)))[!(grepl("-", intersect(PG$Macrophages, rownames(scRNA))))] ){ #"FOS", 
+  pg = clustree(scRNA, prefix = "integrated_snn_res.", node_colour = el, node_colour_aggr = "median") + scale_color_gradientn(colours = c("blue4", "red", "yellow"),values = c(0,0.5,1))
+  ggsave(plot = pg, filename = paste("clustree PG Macrophages ", el, ".png", sep = ""), width = 10, height = 8, dpi = 400)
+  ggsave(plot = pg, filename = paste("clustree PG Macrophages ", el, ".png", sep = ""), width = 10, height = 8, dpi = 400)
+}
+```
+
+```{r}
+
+x = sapply(levels(Idents(scRNA)), function(el){
+  mean(scRNA@assays$RNA@counts["TMEM119",rownames(scRNA[[]][Idents(scRNA)==el,])])
+})
+
+x = x[order(x)]
+
+#X = factor(paste("C", Idents(scRNA), sep = ""))
+X = Idents(scRNA)
+
+for(el in names(x)){
+  X = relevel(X, el)
+}
+
+Idents(scRNA) = X
+
+setwd(paste(wd, "//MoMa", sep = ""))
+scRNA = subset(scRNA, subset = sel == "yes")
+save(scRNA, file = "scRNA1.Rdata")
+```
+
+
+
+```{r}
+scRNA <- ScaleData(scRNA)
+scRNA <- FindVariableFeatures(scRNA)
+```
+
+
+```{r}
+DoHeatmap(scRNA, features = (intersect(PG$Macrophages, scRNA.markers[scRNA.markers$p_val_adj<0.05,]$gene)))
+```
+
+```{r}
+DoHeatmap(scRNA, features = (intersect(PG$Monocytes, scRNA.markers[scRNA.markers$p_val_adj<0.05,]$gene)))
+```
+
+
+```{r}
+DoHeatmap(scRNA, features = (intersect(PG$`Myeloid-derived suppressor cells`, scRNA.markers[scRNA.markers$p_val_adj<0.05,]$gene)))
+```
+
+```{r}
+DoHeatmap(scRNA, features = (intersect(PG$Microglia, scRNA.markers[scRNA.markers$p_val_adj<0.05,]$gene)))
+```
+
+```{r}
+DoHeatmap(scRNA, features = (intersect(markers$gene, scRNA.markers[scRNA.markers$p_val_adj<0.05,]$gene)))
+```
+
+```{r}
+DimPlot(scRNA, reduction = "umap", label = T)
+```
+
+```{r}
+DimPlot(scRNA, reduction = "umap", label = T, group.by = "singleR")
+```
+
+
+
+```{r}
+setwd(paste(wd, "//MoMa", sep = ""))
+for(el in rev(unique(c("ARG2", "IL10", "TGFB1", "TGFB2", "TGFB3", "STAT3", "IL4R", "IL1B", "VEGFA", "RB1", "DDIT3")))){
+  p1 = FeaturePlot(scRNA, features = el) + scale_color_gradientn(colours = c("gray", "blue", "green", "yellow"),values = c(0,0.3,0.6, 1))
+  p = FeaturePlot(scRNA, features = el, slot = "counts") 
+    p = p + scale_color_gradientn(colours = c("gray", "cornflowerblue", "blue4", "red4", "red"),values = (c(min(ggplot_build(p)$plot$data[,4]),
+    min(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]),
+    median(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]),
+    mean(ggplot_build(p)$plot$data[,4][ggplot_build(p)$plot$data[,4]>(median(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))]),
+    max(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))-min(ggplot_build(p)$plot$data[,4]))/max(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))
+  ggsave(grid.arrange(p1, p, ncol=2), filename = paste("MDSC_Bronte_", el, ".png", sep = ""), dpi=400, width = 15, height = 7)
+}
+```
+
+```{r}
+library(gridExtra)
+p1 = list()
+for(el in c("HLA-DRA", "CD14", "CD33", "ITGA4", "CD84", "IL1B")){
+  p = FeaturePlot(scRNA, features = el, slot = "counts")
+  p = p + scale_color_gradientn(colours = c("gray", "cornflowerblue", "blue4", "red4", "red"),values = (c(min(ggplot_build(p)$plot$data[,4]),
+      min(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]),
+      median(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]),
+      mean(ggplot_build(p)$plot$data[,4][ggplot_build(p)$plot$data[,4]>(median(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))]),
+      max(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))-min(ggplot_build(p)$plot$data[,4]))/max(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))
+  p1[[el]] = p
+}
+
+setwd(paste(wd, "//MoMa", sep = ""))
+ggsave(do.call("grid.arrange", c(p1, ncol=3)), filename = "MMDSC_markers.png", width = 24, height = 12, dpi = 400)
+
+p1 = list()
+for(el in c("CD14", "CD33", "ITGA4", "OLR1", "CYBB", "TGFB1", "EIF4E", "XBP1", "CD84")){
+  p = FeaturePlot(scRNA, features = el, slot = "counts")
+  p = p + scale_color_gradientn(colours = c("gray", "cornflowerblue", "blue4", "red4", "red"),values = (c(min(ggplot_build(p)$plot$data[,4]),
+      min(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]),
+      median(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]),
+      mean(ggplot_build(p)$plot$data[,4][ggplot_build(p)$plot$data[,4]>(median(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))]),
+      max(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))-min(ggplot_build(p)$plot$data[,4]))/max(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))
+  p1[[el]] = p
+}
+
+setwd(paste(wd, "//MoMa", sep = ""))
+ggsave(do.call("grid.arrange", c(p1, ncol=3)), filename = "PMNMDSC_markers.png", width = 24, height = 18, dpi = 400)
+
+p1 = list()
+for(el in c("ITGAM", "TMEM119", "CX3CR1", "P2RY12", "P2RY13", "AIF1", "CX3CR1", "CCL3", "CCL4", "MERTK")){
+  p = FeaturePlot(scRNA, features = el, slot = "counts")
+  p = p + scale_color_gradientn(colours = c("gray", "cornflowerblue", "blue4", "red4", "red"),values = (c(min(ggplot_build(p)$plot$data[,4]),
+      min(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]),
+      median(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]),
+      mean(ggplot_build(p)$plot$data[,4][ggplot_build(p)$plot$data[,4]>(median(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))]),
+      max(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))-min(ggplot_build(p)$plot$data[,4]))/max(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))
+  p1[[el]] = p
+}
+
+setwd(paste(wd, "//MoMa", sep = ""))
+ggsave(do.call("grid.arrange", c(p1, ncol=3)), filename = "Microglia_markers.png", width = 24, height = 18, dpi = 400)
+
+p1 = list()
+for(el in c("ITGAM", "LPL", "CD68", "CSF1R", "CD163", "MRC1", "MRC2", "CX3CR1", "LYVE1")){
+  p = FeaturePlot(scRNA, features = el, slot = "counts")
+  p = p + scale_color_gradientn(colours = c("gray", "cornflowerblue", "blue4", "red4", "red"),values = (c(min(ggplot_build(p)$plot$data[,4]),
+      min(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]),
+      median(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]),
+      mean(ggplot_build(p)$plot$data[,4][ggplot_build(p)$plot$data[,4]>(median(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))]),
+      max(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))-min(ggplot_build(p)$plot$data[,4]))/max(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))
+  p1[[el]] = p
+}
+
+setwd(paste(wd, "//MoMa", sep = ""))
+ggsave(do.call("grid.arrange", c(p1, ncol=3)), filename = "BAM_markers.png", width = 24, height = 18, dpi = 400)
+```
+
+
+```{r}
+```
+
+```{r}
+p1 = list()
+for(el in c("HLA-DRA", "CD14", "CD33", "ITGA4", "CD84", "IL1B")){
+  p = FeaturePlot(scRNA, features = el)
+  p = p + scale_color_gradientn(colours = c("gray85", "darkslategray1", "lightpink", "red", "orangered4"),values = (c(min(ggplot_build(p)$plot$data[,4]),
+      mean(ggplot_build(p)$plot$data[,4][ggplot_build(p)$plot$data[,4]>(median(ggplot_build(p)$plot$data[,4]))]),
+      median(ggplot_build(p)$plot$data[,4]),
+      mean(ggplot_build(p)$plot$data[,4][ggplot_build(p)$plot$data[,4]>(median(ggplot_build(p)$plot$data[,4]))]),
+      max(ggplot_build(p)$plot$data[,4]))-min(ggplot_build(p)$plot$data[,4]))/max(ggplot_build(p)$plot$data[,4]))
+  p1[[el]] = p
+}
+
+setwd(paste(wd, "//MoMa", sep = ""))
+ggsave(do.call("grid.arrange", c(p1, ncol=3)), filename = "MMDSC_markers_norm.png", width = 24, height = 12, dpi = 400)
+
+p1 = list()
+for(el in c("CD14", "CD33", "ITGA4", "OLR1", "CYBB", "TGFB1", "EIF4E", "XBP1", "CD84")){
+  p = FeaturePlot(scRNA, features = el)
+  p = p + scale_color_gradientn(colours = c("gray80", "darkslategray1", "lightpink", "red", "orangered4"),values = (c(min(ggplot_build(p)$plot$data[,4]),
+      min(ggplot_build(p)$plot$data[,4]),
+      median(ggplot_build(p)$plot$data[,4]),
+      mean(ggplot_build(p)$plot$data[,4][ggplot_build(p)$plot$data[,4]>(median(ggplot_build(p)$plot$data[,4]))]),
+      max(ggplot_build(p)$plot$data[,4]))-min(ggplot_build(p)$plot$data[,4]))/max(ggplot_build(p)$plot$data[,4]))
+  p1[[el]] = p
+}
+
+setwd(paste(wd, "//MoMa", sep = ""))
+ggsave(do.call("grid.arrange", c(p1, ncol=3)), filename = "PMNMDSC_markers_norm.png", width = 24, height = 18, dpi = 400)
+
+p1 = list()
+for(el in c("ITGAM", "LPL", "TMEM119", "CX3CR1", "P2RY12", "P2RY13", "AIF1", "CX3CR1", "CCL3", "MERTK")){
+  p = FeaturePlot(scRNA, features = el)
+  p = p + scale_color_gradientn(colours = c("gray80", "darkslategray1", "lightpink", "red", "orangered4"),values = (c(min(ggplot_build(p)$plot$data[,4]),
+      min(ggplot_build(p)$plot$data[,4]),
+      median(ggplot_build(p)$plot$data[,4]),
+      mean(ggplot_build(p)$plot$data[,4][ggplot_build(p)$plot$data[,4]>(median(ggplot_build(p)$plot$data[,4]))]),
+      max(ggplot_build(p)$plot$data[,4]))-min(ggplot_build(p)$plot$data[,4]))/max(ggplot_build(p)$plot$data[,4]))
+  p1[[el]] = p
+}
+
+setwd(paste(wd, "//MoMa", sep = ""))
+ggsave(do.call("grid.arrange", c(p1, ncol=3)), filename = "Microglia_markers_norm.png", width = 24, height = 18, dpi = 400)
+
+p1 = list()
+for(el in c("ITGAM", "PTPRC", "CD68", "CSF1R", "CD163", "MRC1", "MRC2", "CX3CR1", "LYVE1")){
+  p = FeaturePlot(scRNA, features = el)
+  p = p + scale_color_gradientn(colours = c("gray80", "darkslategray1", "lightpink", "red", "orangered4"),values = (c(min(ggplot_build(p)$plot$data[,4]),
+      min(ggplot_build(p)$plot$data[,4]),
+      median(ggplot_build(p)$plot$data[,4]),
+      mean(ggplot_build(p)$plot$data[,4][ggplot_build(p)$plot$data[,4]>(median(ggplot_build(p)$plot$data[,4]))]),
+      max(ggplot_build(p)$plot$data[,4]))-min(ggplot_build(p)$plot$data[,4]))/max(ggplot_build(p)$plot$data[,4]))
+  p1[[el]] = p
+}
+
+setwd(paste(wd, "//MoMa", sep = ""))
+ggsave(do.call("grid.arrange", c(p1, ncol=3)), filename = "BAM_markers_norm.png", width = 24, height = 18, dpi = 400)
+```
+
+
+```{r}
+setwd(paste(wd, "//MoMa", sep = ""))
+for( el in 1:length(markers$gene)){
+  if(markers[el,"gene"] %in% scRNA.markers[scRNA.markers$p_val_adj<0.05,]$gene){
+    p = FeaturePlot(scRNA, features = markers[el,"gene"], slot = "counts") 
+    p = p + scale_color_gradientn(colours = c("gray", "cornflowerblue", "blue4", "red4", "red"),values = (c(min(ggplot_build(p)$plot$data[,4]),
+    min(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]),
+    median(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]),
+    mean(ggplot_build(p)$plot$data[,4][ggplot_build(p)$plot$data[,4]>(median(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))]),
+    max(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))-min(ggplot_build(p)$plot$data[,4]))/max(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))
+    ggsave(p, filename = gsub("/", " ", gsub("\n", " ", paste("markers ", as.character(markers[el, "group"]), " ", as.character(markers[el, "gene"]),  ".png", sep = ""))), dpi=400, width = 8, height = 6)
+  }
+}
+```
+
+```{r}
+el = "MRC1"
+p = FeaturePlot(scRNA, features = el, slot = "counts") 
+    p = p + scale_color_gradientn(colours = c("gray", "cornflowerblue", "blue4", "red4", "red"),values = (c(min(ggplot_build(p)$plot$data[,4]),
+    min(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]),
+    median(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]),
+    mean(ggplot_build(p)$plot$data[,4][ggplot_build(p)$plot$data[,4]>(median(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))]),
+    max(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))-min(ggplot_build(p)$plot$data[,4]))/max(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))
+    p
+```
+
+
+```{r}
+el = "CYBB"
+p = FeaturePlot(scRNA, features = el, slot = "counts") 
+    p = p + scale_color_gradientn(colours = c("gray", "cornflowerblue", "blue4", "red4", "red"),values = (c(min(ggplot_build(p)$plot$data[,4]),
+    min(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]),
+    median(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]),
+    mean(ggplot_build(p)$plot$data[,4][ggplot_build(p)$plot$data[,4]>(median(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))]),
+    max(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))-min(ggplot_build(p)$plot$data[,4]))/max(ggplot_build(p)$plot$data[,4][!ggplot_build(p)$plot$data[,4]==0]))
+    p
+```
+```{r}
+scRNA.markers
+```
+
+
+
+```{r}
+wd = getwd()
+setwd(paste(wd, "//MoMa", sep = ""))
+load(file = "GSE138794_scRNA_clusters.Rdata")
+
+Idents(scRNA) = scRNA$integrated_snn_res.0.7
+
+x = sapply(levels(Idents(scRNA)), function(el){
+  mean(scRNA@assays$RNA@counts["TMEM119",rownames(scRNA[[]][Idents(scRNA)==el,])])
+})
+
+x = x[order(x)]
+
+#X = factor(paste("C", Idents(scRNA), sep = ""))
+X = Idents(scRNA)
+
+for(el in names(x)){
+  X = relevel(X, el)
+}
+
+library(plyr)
+X = mapvalues(X, to = 0:max(as.numeric(as.character(levels(X)))), from = levels(X))
+
+Idents(scRNA) = X
+
+DimPlot(scRNA, reduction = "umap", label = T)
+
+scRNA.markers = FindAllMarkers(scRNA)
+```
+
+```{r}
+preprocess <- preprocess(as.matrix(scRNA@assays$RNA@counts), minexpr_percent = 0.4,  cvcutoff = 0.5)
+dim(preprocess)
+```
+```{r}
+tscan <- exprmclust(preprocess)
+
+scRNA[["tscan"]] = tscan$clusterid[rownames(scRNA[[]])]
+
+DimPlot(scRNA, group.by = "tscan")
+```
+
+```{r}
+DimPlot(scRNA, reduction = "tscan_pca", group.by = "tscan")
+```
+
+```{r}
+x = tscan$pcareduceres
+colnames(x) = gsub("PC", "TSCAN_", colnames(x))
+scRNA[["tscan_pca"]] <- CreateDimReducObject(embeddings = x, key = "TSCAN_", assay = DefaultAssay(scRNA))
+```
+
+
+
+
+
+
+```{r}
+diffval <- difftest(preprocess,TSCANorder(tscan))
+
+diffval[order(diffval$qval),]
+```
+
+```{r}
+intersect(rownames(diffval[diffval$qval<0.05,]), markers$gene)
+```
+
+```{r}
+expr <- log2(as.matrix(scRNA@assays$RNA@counts)["S100A6",]+1)
+singlegeneplot(expr, TSCANorder(tscan,flip=TRUE,orderonly=FALSE))
+```
+
+```{r}
+p = FeaturePlot(scRNA, features = "IL1B", reduction = "tscan_pca", slot = "counts")
+p = p + scale_color_gradientn(colours = c("gray80", "darkslategray1", "lightpink", "red", "orangered4"),values = (c(min(ggplot_build(p)$plot$data[,4]),
+      min(ggplot_build(p)$plot$data[,4]),
+      median(ggplot_build(p)$plot$data[,4]),
+      mean(ggplot_build(p)$plot$data[,4][ggplot_build(p)$plot$data[,4]>(median(ggplot_build(p)$plot$data[,4]))]),
+      max(ggplot_build(p)$plot$data[,4]))-min(ggplot_build(p)$plot$data[,4]))/max(ggplot_build(p)$plot$data[,4]))
+
+p
+```
+
+```{r}
+wd = getwd()
+setwd(paste(wd, "//MoMa", sep = ""))
+Idents(scRNA) = scRNA[[]]$tscan
+markers = markers[markers$ofi=="yes",]
+el = as.character(markers$group)
+el = sapply(el, function(x){
+  paste(toupper(substr(x,1,1)), substr(x,2,nchar(x)), sep = "")
+})
+
+el = sapply(el, function(x){
+  if(nchar(x)>25){
+    x = paste(substr(x, 1, which(strsplit(x, "")[[1]]==" ")[which.min(abs((2*which(strsplit(x, "")[[1]]==" ")/nchar(x))-1))]-1),substr(x, which(strsplit(x, "")[[1]]==" ")[which.min(abs((2*which(strsplit(x, "")[[1]]==" ")/nchar(x))-1))]+1, nchar(x)), sep = "\n")
+  }
+  return(x)
+})
+markers$group = as.factor(el)
+
+p = DotPlot(scRNA, features = unique(as.character(markers$gene)), assay = "RNA", cols = "RdYlBu")
+p = p + RotatedAxis()
+p$data$group = as.character(markers$group)[match(as.character(p$data$features.plot), as.character(markers$gene))]
+
+p$data$group = factor(p$data$group, order = F)
+
+for(el in rev(unique(as.character(markers$group)))){
+  if(sum(p$data$group==el)>0){
+    p$data$group = relevel(p$data$group, ref = el)
+  }
+}
+
+p = p + facet_grid(. ~ group, drop = T, scales = "free_x", space = "free_x") +theme(strip.text.x = element_text(angle=90))
+x = length(unique(ggplot_build(p)$plot$data$features.plot))/5
+p1 = DimPlot(scRNA, reduction = "tscan_pca", label = T, cols = "Set2") + ggtitle("Macrophages - TSCAN groups")
+
+p = grid.arrange(p1,p, nrow = 1, widths = c(9, 3+x))
+
+ggsave(p, filename = "markers_TSCAN.pdf", width = 12+x, height = 7)
+ggsave(p, filename = "markers_TSCAN.png", width = 12+x, height = 7)
+
+
+panglao = PG
+panglao = panglao[c("Myeloid-derived suppressor cells", "Macrophages", "Monocytes", "Microglia", "Neutrophils")]
+panglao = sapply(panglao, function(x){x = intersect(x, rownames(scRNA))})
+panglao = data.frame(gene = unlist(panglao), group = rep(names(panglao), times = sapply(panglao, length)))
+p = DotPlot(scRNA, features = unique(as.character(panglao$gene)), assay = "RNA", cols = "RdYlBu")
+p = p + RotatedAxis()
+p$data$group = as.character(panglao$group)[match(as.character(p$data$features.plot), as.character(panglao$gene))]
+
+p$data$group = factor(p$data$group, order = F)
+
+for(el in rev(unique(as.character(panglao$group)))){
+  if(sum(p$data$group==el)>0){
+    p$data$group = relevel(p$data$group, ref = el)
+  }
+}
+
+p = p + facet_grid(. ~ group, drop = T, scales = "free_x", space = "free_x") +theme(strip.text.x = element_text(angle=90))
+p1 = DimPlot(scRNA, reduction = "tscan_pca", label = T, cols = "Set2") + ggtitle("Macrophages - TSCAN groups")
+
+p = grid.arrange(p1,p, nrow = 1,  widths = c(9, 3+x))
+
+ggsave(p, filename = "panglao_TSCAN.pdf", width = 12+x, height = 7)
+ggsave(p, filename = "panglao_TSCAN.png", width = 12+x, height = 7)
+```
+
+
+
+```{r}
+scRNA[["tscan"]] <- CreateDimReducObject(embeddings = tscan$pcareduceres, key = "TSCAN_", assay = DefaultAssay(scRNA))
+```
+
+
+```{r}
+intersect(markers[grepl("mmdsc", tolower(markers$group)),"gene"], scRNA.markers[scRNA.markers$p_val_adj<0.05,]$gene)
+intersect(markers[grepl("pmnmdsc", tolower(markers$group)),"gene"], scRNA.markers[scRNA.markers$p_val_adj<0.05,]$gene)
+intersect(markers[grepl("microglia", tolower(markers$group)),"gene"], scRNA.markers[scRNA.markers$p_val_adj<0.05,]$gene)
+intersect(markers[grepl("border", tolower(markers$group)),"gene"], scRNA.markers[scRNA.markers$p_val_adj<0.05,]$gene)
+```
+
+
+```{r}
+tcp_counts = function(scRNA, gene1, gene2){
+  df = data.frame(gene1 = scRNA@assays$RNA@counts[gene1,],
+           gene2 = scRNA@assays$RNA@counts[gene2,],
+           UMAP1 = scRNA@reductions$umap@cell.embeddings[,"UMAP_1"],
+           UMAP2 = scRNA@reductions$umap@cell.embeddings[,"UMAP_2"])
+  
+  df$gene1 = log2(df$gene1+0.01)
+  df$gene2 = log2(df$gene2+0.01)
+
+  p = ggplot(df, aes(x = UMAP1, y = UMAP2,  color = gene1, color2 = gene2)) +
+    geom_point() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+    scale_color_colorplane(color_projection = red_blue_projection, axis_title = gene1, axis_title_y = gene2)
+  
+  return(p)
+}
+```
+
+```{r}
+p1 = list()
+x = c("TMEM119", "CX3CR1",  "P2RY12", "CSF1")
+x = combn(x = x, m = 2)
+for(el in 1:dim(x)[2]){
+  p = tcp_counts(scRNA, gene1 = x[1,el], gene2 = x[2,el])
+  p1[[paste(EL, el, sep = "")]] = p
+}
+
+setwd(paste(wd, "//MoMa", sep = ""))
+ggsave(file = "Microglia.png", plot = marrangeGrob(p1, nrow = dim(x)[2]/2, ncol = 2), width = 12, height = 4*dim(x)[2]/2)
+```
+```{r}
+p1 = list()
+x = c("CD163", "LYVE1", "APOE", "MS4A7")
+x = combn(x = x, m = 2)
+for(el in 1:dim(x)[2]){
+  p = tcp_counts(scRNA, gene1 = x[1,el], gene2 = x[2,el])
+  p1[[paste(EL, el, sep = "")]] = p
+}
+
+setwd(paste(wd, "//MoMa", sep = ""))
+ggsave(file = "BAM.png", plot = marrangeGrob(p1, nrow = dim(x)[2]/2, ncol = 2), width = 12, height = 4*dim(x)[2]/2)
+```
+
+
+
+
+```{r}
+setwd(paste(wd, "//MoMa", sep = ""))
+ggsave(file = "GoldmanBAM.png", plot = tcp_counts(scRNA, gene1 = "MRC1", gene2 = "MS4A7"), width = 8, height = 6)
+```
+
+```{r}
+p1 = list()
+x = c("HLA-DRA", "CD14",  "CD33",  "S100A8",  "S100A9",   "IL1B")
+x = combn(x = x, m = 2)
+for(el in 1:dim(x)[2]){
+  p = tcp_counts(scRNA, gene1 = x[1,el], gene2 = x[2,el])
+  p1[[paste(EL, el, sep = "")]] = p
+}
+
+setwd(paste(wd, "//MoMa", sep = ""))
+ggsave(file = "MMDSC.png", plot = marrangeGrob(p1, nrow = dim(x)[2]/3, ncol = 3), width = 18, height = 4*dim(x)[2]/3)
+```
+
+```{r}
+p1
+```
+
+
+```{r}
+x = c("CD14", "S100A8", "S100A9", "OLR1",   "XBP1",   "IL1B",   "CD84" )
+x = combn(x = x, m = 2)
+for(el in 1:dim(x)[2]){
+  p = tcp_counts(scRNA, gene1 = x[1,el], gene2 = x[2,el])
+  p1[[paste(EL, el, sep = "")]] = p
+}
+
+setwd(paste(wd, "//MoMa", sep = ""))
+ggsave(file = "PMNMDSC.png", plot = marrangeGrob(p1, nrow = dim(x)[2]/3, ncol = 3), width = 18, height = 4*dim(x)[2]/3)
+```
+
+```{r}
+p1 = list()
+x = c("TMEM119",  "P2RY12", "S100A8",  "IL1B")
+x = combn(x = x, m = 2)
+for(el in 1:dim(x)[2]){
+  p = tcp_counts(scRNA, gene1 = x[1,el], gene2 = x[2,el])
+  p1[[paste(EL, el, sep = "")]] = p
+}
+
+setwd(paste(wd, "//MoMa", sep = ""))
+ggsave(file = "MicrogliaMMDSC.png", plot = marrangeGrob(p1, nrow = dim(x)[2]/2, ncol = 2), width = 12, height = 4*dim(x)[2]/2)
+```
+
+
+```{r}
+p1 = list()
+x = c("MRC1", "MS4A7", "P2RY12", "TMEM119") 
+x = combn(x = x, m = 2)
+for(el in 1:dim(x)[2]){
+  p = tcp_counts(scRNA, gene1 = x[1,el], gene2 = x[2,el])
+  p1[[paste(EL, el, sep = "")]] = p
+}
+
+setwd(paste(wd, "//MoMa", sep = ""))
+ggsave(file = "Goldman2.png", plot = marrangeGrob(p1, nrow = dim(x)[2]/2, ncol = 2), width = 12, height = 4*dim(x)[2]/2)
+```
+
+```{r}
+
+x1 = c("TMEM119", "CX3CR1",  "P2RY12", "CSF1", "LPL")
+x2 = c("HLA-DRA",    "S100A8",   "IL1B")
+p1 = list()
+for(EL in x1){
+  for(el in x2){
+    p = tcp_counts(scRNA, gene1 = EL, gene2 = el)
+    p1[[paste(EL, el, sep = "")]] = p
+  }
+}
+
+setwd(paste(wd, "//MoMa", sep = ""))
+ggsave(file = "MMDSC_microglia.png", plot = marrangeGrob(p1, nrow = length(x2), ncol = length(x1)), width = 6*length(x1), height = 4*length(x2))
+```
+
+
+```{r}
+tcp_norm = function(scRNA, gene1, gene2){
+  df = data.frame(gene1 = scRNA@assays$integrated@scale.data[gene1,],
+           gene2 = scRNA@assays$integrated@scale.data[gene2,],
+           UMAP1 = scRNA@reductions$umap@cell.embeddings[,"UMAP_1"],
+           UMAP2 = scRNA@reductions$umap@cell.embeddings[,"UMAP_2"])
+
+  p = ggplot(df, aes(x = UMAP1, y = UMAP2,  color = gene1, color2 = gene2)) +
+    geom_point() + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank()) +
+    scale_color_colorplane(color_projection = red_blue_projection, axis_title = gene1, axis_title_y = gene2)
+  
+  return(p)
+}
+```
+
+```{r}
+p1 = list()
+x = c("TMEM119", "CX3CR1",  "P2RY12", "CSF1")
+x = combn(x = x, m = 2)
+for(el in 1:dim(x)[2]){
+  p = tcp_norm(scRNA, gene1 = x[1,el], gene2 = x[2,el])
+  p1[[paste(EL, el, sep = "")]] = p
+}
+
+setwd(paste(wd, "//MoMa", sep = ""))
+ggsave(file = "Microglianorm.png", plot = marrangeGrob(p1, nrow = dim(x)[2]/2, ncol = 2), width = 12, height = 4*dim(x)[2]/2)
+```
+
+```{r}
+p1
+```
+
+
+```{r}
+p1 = list()
+x = c("CD163", "LYVE1", "APOE", "MS4A7")
+x = combn(x = x, m = 2)
+for(el in 1:dim(x)[2]){
+  p = tcp_norm(scRNA, gene1 = x[1,el], gene2 = x[2,el])
+  p1[[paste(EL, el, sep = "")]] = p
+}
+
+setwd(paste(wd, "//MoMa", sep = ""))
+ggsave(file = "BAMnorm.png", plot = marrangeGrob(p1, nrow = dim(x)[2]/2, ncol = 2), width = 12, height = 4*dim(x)[2]/2)
+```
+```{r}
+#setwd(paste(wd, "//MoMa", sep = ""))
+#ggsave(file = "GoldmanBAMnorm.png", plot = tcp_norm(scRNA, gene1 = "MRC1", gene2 = "CD36"), width = 8, height = 6)
+```
+
+```{r}
+x = c("HLA-DRA", "CD14",  "S100A8",  "S100A9",  "CD274",   "IL1B")
+intersect(x, rownames(scRNA))
+x = combn(x = x, m = 2)
+for(el in 1:dim(x)[2]){
+  p = tcp_norm(scRNA, gene1 = x[1,el], gene2 = x[2,el])
+  p1[[paste(EL, el, sep = "")]] = p
+}
+
+setwd(paste(wd, "//MoMa", sep = ""))
+ggsave(file = "MMDSCnorm.png", plot = marrangeGrob(p1, nrow = dim(x)[2]/3, ncol = 3), width = 18, height = 4*dim(x)[2]/3)
+```
+
+
+```{r}
+x = c("CD14", "S100A8", "S100A9", "OLR1",   "XBP1",   "IL1B",   "CD84" )
+x = combn(x = x, m = 2)
+for(el in 1:dim(x)[2]){
+  p = tcp_norm(scRNA, gene1 = x[1,el], gene2 = x[2,el])
+  p1[[paste(EL, el, sep = "")]] = p
+}
+
+setwd(paste(wd, "//MoMa", sep = ""))
+ggsave(file = "PMNMDSCnorm.png", plot = marrangeGrob(p1, nrow = dim(x)[2]/3, ncol = 3), width = 18, height = 4*dim(x)[2]/3)
+```
+```{r}
+p1 = list()
+x = c("TMEM119",  "P2RY12", "S100A8",  "IL1B")
+x = combn(x = x, m = 2)
+for(el in 1:dim(x)[2]){
+  p = tcp_norm(scRNA, gene1 = x[1,el], gene2 = x[2,el])
+  p1[[paste(EL, el, sep = "")]] = p
+}
+
+setwd(paste(wd, "//MoMa", sep = ""))
+ggsave(file = "MicrogliaMMDSCnorm.png", plot = marrangeGrob(p1, nrow = dim(x)[2]/2, ncol = 2), width = 12, height = 4*dim(x)[2]/2)
+```
+
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
